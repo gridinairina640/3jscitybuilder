@@ -1,3 +1,4 @@
+import React from 'react';
 import { BuildingType } from '../../entities/Buildings';
 import { UnitType } from '../../entities/Units';
 
@@ -33,7 +34,8 @@ export interface GameEvent {
   severity: 'GOOD' | 'BAD' | 'NEUTRAL';
 }
 
-// Augment JSX namespace for React Three Fiber elements to prevent type errors
+// Augment JSX namespace for React Three Fiber elements to prevent type errors.
+// This handles cases where R3F types are not automatically picked up.
 declare global {
   namespace JSX {
     interface IntrinsicElements {
@@ -41,6 +43,7 @@ declare global {
       group: any;
       mesh: any;
       instancedMesh: any;
+      primitive: any;
       
       // Geometry
       boxGeometry: any;
@@ -53,12 +56,17 @@ declare global {
       // Materials
       meshStandardMaterial: any;
       meshBasicMaterial: any;
+      meshPhongMaterial: any;
       
       // Lights & Others
       ambientLight: any;
       directionalLight: any;
       pointLight: any;
+      spotLight: any;
       color: any;
+
+      // Fallback index signature to catch any other R3F elements
+      [elemName: string]: any;
     }
   }
 }
