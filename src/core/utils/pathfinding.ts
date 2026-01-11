@@ -18,11 +18,12 @@
 import { TileData, TileType } from '../../entities/Map';
 import { Coordinates } from '../../shared/types';
 
-// REFERENCE: High-performance A* Pathfinding (v3.5.0)
-// Improvements (v3.5.0): 
-// - Fixed tentativeG calculation to use gScore source of truth
-// - Added 'failToClosest' option (RTS-style movement to unreachable targets)
-// - Relaxed target walkability checks when failToClosest is enabled
+// REFERENCE: High-performance A* Pathfinding (v3.6.0)
+// Improvements (v3.6.0): 
+// - Added strict NaN checks for inputs to prevent cache poisoning
+// - Implemented dynamic SAFETY_LIMIT for maxIterations based on map size
+// - Added warnings for heuristicWeight usage
+// - Refined tie-breaking comments
 
 const COSTS = {
   ROAD: 0.5,
@@ -63,7 +64,11 @@ export interface PathResult {
 export interface PathOptions {
   maxIterations?: number;
   signal?: AbortSignal;
-  heuristicWeight?: number; // > 1.0 for faster, greedy search
+  /**
+   * Weight > 1.0 makes A* "Greedy" (faster but path may not be optimal/shortest).
+   * WARNING: High weights with failToClosest might return suboptimal partial paths.
+   */
+  heuristicWeight?: number; 
   includeStartNode?: boolean; // If true, the path includes the start coordinates
   failToClosest?: boolean; // If target is unreachable, return path to the closest reachable node
 }
@@ -340,9 +345,19 @@ export class PathfindingService {
         return { path: [], status: 'aborted' };
     }
 
+    // Input Validation
+    if (!Number.isFinite(start.x) || !Number.isFinite(start.z) || 
+        !Number.isFinite(end.x) || !Number.isFinite(end.z)) {
+        return { path: [], status: 'invalid_args' };
+    }
+
     const sIdx = this.toIndex(start.x, start.z);
     const eIdx = this.toIndex(end.x, end.z);
-    const maxIter = options.maxIterations ?? this.defaultMaxIterations;
+    
+    // Safety Cap: Prevent infinite loops on huge maps if logic fails
+    const safetyLimit = Math.max(this.totalTiles * 2, 50000);
+    const maxIter = Math.min(options.maxIterations ?? this.defaultMaxIterations, safetyLimit);
+
     const hWeight = options.heuristicWeight ?? 1.0;
     const includeStart = options.includeStartNode ?? false;
     const failToClosest = options.failToClosest ?? false;

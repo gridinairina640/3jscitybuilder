@@ -9,7 +9,7 @@ import React, { useEffect, useState } from 'react';
 import { Canvas } from '@react-three/fiber';
 import { OrbitControls, Stars } from '@react-three/drei';
 
-import { GameMap } from './components/GameMap';
+import { GameMap } from './src/components/GameMap';
 import { UI } from './components/UI';
 import { generateGameEvent } from './services/geminiService';
 import { useGameStore } from './src/infrastructure/store/useGameStore';

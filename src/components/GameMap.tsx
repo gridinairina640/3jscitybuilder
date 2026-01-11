@@ -8,9 +8,9 @@
 
 import React from 'react';
 import * as THREE from 'three';
-import { useGameStore } from '../src/infrastructure/store/useGameStore';
-import { MapTerrain } from '../src/view/components/MapTerrain';
-import { BuildingRenderer } from '../src/view/components/BuildingRenderer';
+import { useGameStore } from '../infrastructure/store/useGameStore';
+import { MapTerrain } from '../view/components/MapTerrain';
+import { BuildingRenderer } from '../view/components/BuildingRenderer';
 
 export const GameMap: React.FC = () => {
   const tiles = useGameStore(state => state.tiles);
