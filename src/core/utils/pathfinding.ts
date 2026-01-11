@@ -10,20 +10,18 @@
  * - Conversion: Grid = Math.round(World) + halfSize.
  * 
  * API CONTRACT:
- * - findPath returns an array of coordinates EXCLUDING the start node.
- * - If start === end, returns empty array.
- * - If no path found, returns empty array.
+ * - findPath returns a PathResult object containing the path and status.
+ * - Path excludes the start node.
  */
 
 import { TileData, TileType } from '../../entities/Map';
 import { Coordinates } from '../../shared/types';
 
-// REFERENCE: High-performance A* Pathfinding (v2.6)
-// Improvements (v2.6): 
-// - Reduced initial memory footprint (Heap capacity 1024 vs TotalTiles)
-// - LRU Cache Eviction Strategy
-// - Max Pool Size Limit
-// - Explicit API Documentation
+// REFERENCE: High-performance A* Pathfinding (v2.9)
+// Improvements (v2.9): 
+// - Dynamic Heuristic Cost (Admissibility Guarantee)
+// - Epsilon for Float Comparison (Heap Stability)
+// - Enhanced Cache Metrics
 
 const COSTS = {
   ROAD: 0.5,
@@ -33,16 +31,32 @@ const COSTS = {
   MIN_STEP: 0.5 
 } as const;
 
+// Epsilon for float comparisons to ensure stable tie-breaking
+const EPSILON = 1e-6;
+
 export type NavigationLayer = TileType | 'ROAD' | 'BUILDING';
 
+// Strict mapping using the NavigationLayer type
 const WEIGHT_MAP: Record<string, number> = {
+  [TileType.GRASS]: COSTS.GRASS,
+  [TileType.FOREST]: COSTS.FOREST,
+  [TileType.WATER]: COSTS.OBSTACLE,
+  [TileType.MOUNTAIN]: COSTS.OBSTACLE,
   'ROAD': COSTS.ROAD,
-  'GRASS': COSTS.GRASS,
-  'FOREST': COSTS.FOREST,
-  'WATER': COSTS.OBSTACLE,
-  'MOUNTAIN': COSTS.OBSTACLE,
   'BUILDING': COSTS.OBSTACLE
 };
+
+export type PathStatus = 'success' | 'no_path' | 'timeout' | 'invalid_args';
+
+export interface PathResult {
+  path: Coordinates[];
+  status: PathStatus;
+  metrics?: {
+    iterations: number;
+    duration: number;
+    cached?: boolean;
+  };
+}
 
 /**
  * Структура буферов, необходимых для одного вычисления A*.
@@ -130,12 +144,14 @@ class FlatMinHeap {
       const cf = this.f[idx];
       const pf = this.f[parentIdx];
       
-      // MinHeap property: Parent must be smaller. If Child > Parent, order is correct.
-      if (cf > pf) break;
+      // MinHeap property: Parent must be smaller. 
+      // Using EPSILON for float stability.
+      if (cf > pf + EPSILON) break;
       
-      // Tie-breaking: If F is equal, prefer HIGHER G (closer to target in reliable heuristics)
-      // So if Child G <= Parent G, it's not "better", so we stop.
-      if (cf === pf && this.g[idx] <= this.g[parentIdx]) break;
+      // Tie-breaking: If F is roughly equal, prefer HIGHER G (closer to target).
+      // We only swap if Child is "better".
+      // If Child G <= Parent G, it's not better, so we stop.
+      if (Math.abs(cf - pf) < EPSILON && this.g[idx] <= this.g[parentIdx]) break;
       
       this.swap(idx, parentIdx);
       idx = parentIdx;
@@ -154,9 +170,11 @@ class FlatMinHeap {
 
       // Check Left
       let swapLeft = false;
-      if (lf < bf) {
+      if (lf < bf - EPSILON) { 
+          // Strictly smaller F
           swapLeft = true;
-      } else if (lf === bf && this.g[left] > this.g[best]) {
+      } else if (Math.abs(lf - bf) < EPSILON && this.g[left] > this.g[best]) {
+          // Equal F, but Better G (Higher G)
           swapLeft = true;
       }
 
@@ -168,9 +186,9 @@ class FlatMinHeap {
           const bestF = this.f[best];
           
           let swapRight = false;
-          if (rf < bestF) {
+          if (rf < bestF - EPSILON) {
               swapRight = true;
-          } else if (rf === bestF && this.g[right] > this.g[best]) {
+          } else if (Math.abs(rf - bestF) < EPSILON && this.g[right] > this.g[best]) {
               swapRight = true;
           }
           
@@ -208,6 +226,7 @@ export class PathfindingService {
   private size: number = 0;
   private halfSize: number = 0;
   private gridVersion: number = 0;
+  private minStepCost: number = COSTS.MIN_STEP;
   
   // Cache uses LRU strategy (via Map insertion order)
   private pathCache: Map<string, { path: Coordinates[]; version: number }> = new Map();
@@ -225,7 +244,6 @@ export class PathfindingService {
 
   /**
    * Инициализирует навигационную сетку.
-   * Очищает пул буферов, так как размер карты изменился.
    */
   public syncWithStore(tiles: TileData[], size: number): void {
     this.size = size;
@@ -239,14 +257,23 @@ export class PathfindingService {
     }
     this.grid.fill(COSTS.OBSTACLE);
 
+    let foundMin = Infinity;
+
     tiles.forEach(tile => {
       const idx = this.toIndex(tile.x, tile.z);
       if (idx !== -1) {
           let weight = this.getWeightByType(tile.type);
           if (tile.occupiedBy) weight = COSTS.OBSTACLE;
           this.grid[idx] = weight;
+
+          // Track min weight for admissible heuristic
+          if (Number.isFinite(weight) && weight > 0 && weight < foundMin) {
+              foundMin = weight;
+          }
       }
     });
+
+    this.minStepCost = (foundMin === Infinity) ? COSTS.MIN_STEP : foundMin;
 
     // 2. Reset Buffer Pool (Invalidate old buffers)
     this.bufferPool = [];
@@ -267,6 +294,12 @@ export class PathfindingService {
     
     if (this.grid[idx] !== weight) {
        this.grid[idx] = weight;
+       
+       // Dynamically update minStepCost if we introduce a cheaper node
+       if (Number.isFinite(weight) && weight > 0 && weight < this.minStepCost) {
+           this.minStepCost = weight;
+       }
+
        this.gridVersion++;
     }
   }
@@ -282,29 +315,41 @@ export class PathfindingService {
    * @param start World coordinates of start position
    * @param end World coordinates of target position
    * @param options Configuration options
-   * @returns Array of coordinates representing the path, EXCLUDING the start node.
+   * @returns PathResult object containing status and path (excluding start node).
    */
   public async findPath(
       start: Coordinates, 
       end: Coordinates, 
       options: { maxIterations?: number } = {}
-  ): Promise<Coordinates[]> {
+  ): Promise<PathResult> {
+    const startTime = performance.now();
     const sIdx = this.toIndex(start.x, start.z);
     const eIdx = this.toIndex(end.x, end.z);
 
     // Fail Fast
-    if (sIdx === -1 || eIdx === -1) return [];
-    if (sIdx === eIdx) return [];
-    if (!Number.isFinite(this.grid[sIdx]) || !Number.isFinite(this.grid[eIdx])) return [];
+    if (sIdx === -1 || eIdx === -1) {
+        return { path: [], status: 'invalid_args' };
+    }
+    if (sIdx === eIdx) {
+        return { path: [], status: 'success', metrics: { iterations: 0, duration: 0 } };
+    }
+    if (!Number.isFinite(this.grid[sIdx]) || !Number.isFinite(this.grid[eIdx])) {
+        return { path: [], status: 'no_path' };
+    }
 
     // Check Cache (LRU)
     const cacheKey = `${sIdx}-${eIdx}`;
     const cached = this.pathCache.get(cacheKey);
     if (cached && cached.version === this.gridVersion) {
+        const duration = performance.now() - startTime;
         // Refresh: remove and re-insert to mark as recently used
         this.pathCache.delete(cacheKey);
         this.pathCache.set(cacheKey, cached);
-        return cached.path;
+        return { 
+            path: cached.path, 
+            status: 'success',
+            metrics: { iterations: 0, duration, cached: true } 
+        };
     }
 
     // Acquire Buffers
@@ -313,18 +358,25 @@ export class PathfindingService {
     try {
         const maxIter = options.maxIterations ?? this.defaultMaxIterations;
         const result = this.calculateAStar(sIdx, eIdx, maxIter, buffers);
+        const duration = performance.now() - startTime;
         
-        if (result.length > 0) {
+        if (result.status === 'success') {
           // Cache Maintenance (LRU Eviction)
           if (this.pathCache.size >= this.maxCacheSize) {
-              // Map.keys() returns iterator in insertion order. First item is oldest.
               const oldestKey = this.pathCache.keys().next().value;
               if (oldestKey) this.pathCache.delete(oldestKey);
           }
-          this.pathCache.set(cacheKey, { path: result, version: this.gridVersion });
+          this.pathCache.set(cacheKey, { path: result.path, version: this.gridVersion });
         }
         
-        return result;
+        return {
+            ...result,
+            metrics: {
+                iterations: result.iterations,
+                duration,
+                cached: false
+            }
+        };
     } finally {
         this.releaseBuffers(buffers);
     }
@@ -335,7 +387,7 @@ export class PathfindingService {
       endIdx: number, 
       maxIterations: number, 
       buffers: ComputeBuffers
-  ): Coordinates[] {
+  ): { path: Coordinates[], status: PathStatus, iterations: number } {
     const { gScore, parentIndex, visited, heap, neighbors } = buffers;
 
     // Reset logic (fast fill)
@@ -351,7 +403,9 @@ export class PathfindingService {
 
     while (!heap.isEmpty()) {
       iterations++;
-      if (iterations > maxIterations) return [];
+      if (iterations > maxIterations) {
+          return { path: [], status: 'timeout', iterations };
+      }
 
       const current = heap.pop()!;
       const currentIdx = current.index;
@@ -363,7 +417,8 @@ export class PathfindingService {
       visited[currentIdx] = 1;
 
       if (currentIdx === endIdx) {
-        return this.reconstructPath(endIdx, parentIndex);
+        const path = this.reconstructPath(endIdx, parentIndex);
+        return { path, status: 'success', iterations };
       }
 
       const count = this.fillNeighborsBuffer(currentIdx, neighbors);
@@ -378,6 +433,8 @@ export class PathfindingService {
 
         const tentativeG = current.g + weight;
 
+        // Use strict check. If new path is significantly better (or equal with better heuristic?)
+        // Standard A*: Strictly less.
         if (tentativeG < gScore[neighborIdx]) {
           parentIndex[neighborIdx] = currentIdx;
           gScore[neighborIdx] = tentativeG;
@@ -387,14 +444,12 @@ export class PathfindingService {
       }
     }
 
-    return [];
+    return { path: [], status: 'no_path', iterations };
   }
 
   // --- Pool Management ---
 
   private createBuffers(size: number): ComputeBuffers {
-      // Small initial capacity for heap to save memory. 
-      // It will resize automatically if path is complex.
       const initialHeapCap = 1024; 
       
       return {
@@ -410,7 +465,6 @@ export class PathfindingService {
       if (this.bufferPool.length > 0) {
           return this.bufferPool.pop()!;
       }
-      // Create new if pool empty or exhausted
       const totalTiles = this.size * this.size;
       return this.createBuffers(totalTiles);
   }
@@ -419,7 +473,6 @@ export class PathfindingService {
       if (this.bufferPool.length < this.maxPoolSize) {
           this.bufferPool.push(buffers);
       }
-      // If pool is full, let GC collect these buffers
   }
 
   // --- Helpers ---
@@ -429,15 +482,14 @@ export class PathfindingService {
     const az = Math.floor(aIdx / this.size);
     const bx = bIdx % this.size;
     const bz = Math.floor(bIdx / this.size);
-    return (Math.abs(ax - bx) + Math.abs(az - bz)) * COSTS.MIN_STEP;
+    // Use minStepCost to ensure admissibility
+    return (Math.abs(ax - bx) + Math.abs(az - bz)) * this.minStepCost;
   }
 
   private reconstructPath(endIdx: number, parentIndex: Int32Array): Coordinates[] {
     const path: Coordinates[] = [];
     let curr = endIdx;
     
-    // Standard reconstruction: Stop when we reach start node (parent is -1)
-    // This results in a path that excludes the start node.
     while (parentIndex[curr] !== -1) {
       const gx = curr % this.size;
       const gz = Math.floor(curr / this.size);
@@ -466,13 +518,6 @@ export class PathfindingService {
     return count;
   }
 
-  /**
-   * Converts world X to grid index.
-   * Strategy: Round to nearest integer.
-   * -0.4 -> 0
-   * 0.4 -> 0
-   * 0.6 -> 1
-   */
   private toGridX(worldX: number): number {
     return Math.round(worldX) + this.halfSize;
   }
@@ -498,9 +543,7 @@ export class PathfindingService {
   }
 
   private getWeightByType(type: NavigationLayer): number {
-    // Ensure strict string conversion for safety if type is ever passed incorrectly
-    const t = String(type).toUpperCase();
-    return WEIGHT_MAP[t] ?? COSTS.GRASS;
+    return WEIGHT_MAP[type] ?? COSTS.GRASS;
   }
 }
 

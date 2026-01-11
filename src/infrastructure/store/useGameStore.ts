@@ -219,13 +219,22 @@ export const useGameStore = create<GameState>((set, get) => ({
 
       // 3. Async Pathfinding
       try {
-          const path = await pathfindingService.findPath(unit.position, { x, z });
+          const result = await pathfindingService.findPath(unit.position, { x, z });
           
-          set(state => ({
-              entities: state.entities.map(e => 
-                  e.id === unitId ? { ...e, path, isCalculatingPath: false } : e
-              )
-          }));
+          if (result.status === 'success') {
+            set(state => ({
+                entities: state.entities.map(e => 
+                    e.id === unitId ? { ...e, path: result.path, isCalculatingPath: false } : e
+                )
+            }));
+          } else {
+            console.warn(`Pathfinding failed: ${result.status}`);
+             set(state => ({
+                entities: state.entities.map(e => 
+                    e.id === unitId ? { ...e, isCalculatingPath: false } : e
+                )
+            }));
+          }
       } catch (error) {
           console.error("Pathfinding error", error);
           set(state => ({
