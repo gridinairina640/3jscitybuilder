@@ -18,12 +18,12 @@
 import { TileData, TileType } from '../../entities/Map';
 import { Coordinates } from '../../shared/types';
 
-// REFERENCE: High-performance A* Pathfinding (v2.9.1)
-// Improvements (v2.9.1): 
-// - Fixed BubbleUp Tie-Breaking
-// - Improved Cache Key (options aware)
-// - Dynamic Heap Sizing
-// - Explicit Thread Safety Comments
+// REFERENCE: High-performance A* Pathfinding (v3.1.0)
+// Improvements (v3.1.0): 
+// - Generation-Based Reset (Lazy Initialization) - O(1) setup time
+// - Bitwise math optimizations
+// - Buffer Pool exhaustion warning
+// - Generation counters for closed set and node initialization
 
 const COSTS = {
   ROAD: 0.5,
@@ -39,7 +39,7 @@ const EPSILON = 1e-6;
 export type NavigationLayer = TileType | 'ROAD' | 'BUILDING';
 
 // Strict mapping using the NavigationLayer type
-const WEIGHT_MAP: Record<string, number> = {
+const WEIGHT_MAP: Record<NavigationLayer | string, number> = {
   [TileType.GRASS]: COSTS.GRASS,
   [TileType.FOREST]: COSTS.FOREST,
   [TileType.WATER]: COSTS.OBSTACLE,
@@ -48,7 +48,7 @@ const WEIGHT_MAP: Record<string, number> = {
   'BUILDING': COSTS.OBSTACLE
 };
 
-export type PathStatus = 'success' | 'no_path' | 'timeout' | 'invalid_args';
+export type PathStatus = 'success' | 'no_path' | 'timeout' | 'invalid_args' | 'aborted';
 
 export interface PathResult {
   path: Coordinates[];
@@ -64,9 +64,15 @@ export interface PathResult {
  * Структура буферов, необходимых для одного вычисления A*.
  */
 interface ComputeBuffers {
-  gScore: Float32Array;
-  parentIndex: Int32Array;
-  visited: Uint8Array;
+  gScore: Float32Array; // Dirty buffer
+  parentIndex: Int32Array; // Dirty buffer
+  
+  // Generation counters.
+  // Instead of clearing arrays (O(N)), we increment a searchId.
+  // If array[i] != searchId, the node is considered uninitialized/not visited.
+  nodeState: Uint32Array; // Tracks if node was touched in this search (for gScore/parent init)
+  closedSet: Uint32Array; // Tracks if node is in Closed Set (fully expanded)
+  
   heap: FlatMinHeap;
   neighbors: Int32Array; // Fixed size 4 for Von Neumann neighborhood
 }
@@ -91,14 +97,15 @@ class FlatMinHeap {
     if (this.length >= this.indices.length) {
       this.resize();
     }
-    this.indices[this.length] = index;
-    this.f[this.length] = fVal;
-    this.g[this.length] = gVal;
     
-    // NOTE: We call bubbleUp on the current index (which equals old length).
-    // The length property is incremented AFTER. This is valid.
-    this.bubbleUp(this.length);
+    // Insert at the end
+    const i = this.length;
+    this.indices[i] = index;
+    this.f[i] = fVal;
+    this.g[i] = gVal;
+    
     this.length++;
+    this.bubbleUp(i);
   }
 
   pop(): { index: number, g: number } | undefined {
@@ -152,11 +159,11 @@ class FlatMinHeap {
       // MinHeap property: Parent must be smaller (smaller F is better).
       if (cf > pf + EPSILON) break;
       
-      // Tie-breaking: If F is roughly equal, we prefer HIGHER G (node closer to target).
-      // Higher G means the node is "better" in terms of progress, so it should bubble up (MinHeap stores "best" at top).
-      // Logic:
-      // If Child.G > Parent.G -> Child is better -> Swap.
-      // If Child.G <= Parent.G -> Child is NOT better -> Break.
+      // Tie-breaking:
+      // If F is roughly equal (abs(cf - pf) < EPSILON), we check G.
+      // We want to PRIORITIZE nodes closer to the target (Lower Heuristic H).
+      // Since F = G + H, and F is equal: Higher G => Lower H.
+      // So, if Child.G > Parent.G, Child is "better" (closer to target), so we swap it up.
       if (Math.abs(cf - pf) < EPSILON) {
          if (this.g[idx] <= this.g[parentIdx]) break;
       }
@@ -182,7 +189,7 @@ class FlatMinHeap {
           // Strictly smaller F -> Better
           swapLeft = true;
       } else if (Math.abs(lf - bf) < EPSILON && this.g[left] > this.g[best]) {
-          // Equal F, but Higher G -> Better
+          // Equal F, but Higher G -> Better (Closer to target)
           swapLeft = true;
       }
 
@@ -236,15 +243,15 @@ export class PathfindingService {
   private gridVersion: number = 0;
   private minStepCost: number = COSTS.MIN_STEP;
   
+  // Tracks global search generation to allow O(1) buffer reset
+  private globalSearchId: number = 0;
+  
   // Cache uses LRU strategy (via Map insertion order)
   private pathCache: Map<string, { path: Coordinates[]; version: number }> = new Map();
   private maxCacheSize: number = 2000;
   
   // Buffer Pool for Thread Safety (Reentrancy)
   // NOTE: This pool is NOT thread-safe for multi-threaded environments (Workers).
-  // It is safe for single-threaded concurrency (Async/Await) as long as findPath 
-  // execution blocks (synchronous loop) or properly checks out buffers.
-  // Current calculateAStar is synchronous.
   private bufferPool: ComputeBuffers[] = [];
   private maxPoolSize: number = 4;
   
@@ -259,7 +266,7 @@ export class PathfindingService {
    */
   public syncWithStore(tiles: TileData[], size: number): void {
     this.size = size;
-    this.halfSize = Math.floor(size / 2);
+    this.halfSize = (size / 2) | 0; // Bitwise floor
     
     const totalTiles = size * size;
     
@@ -293,6 +300,7 @@ export class PathfindingService {
     // 3. Reset Cache
     this.gridVersion++;
     this.pathCache.clear();
+    this.globalSearchId = 0; 
   }
 
   public updateNode(x: number, z: number, type: NavigationLayer, occupied: boolean = false): void {
@@ -332,9 +340,15 @@ export class PathfindingService {
   public async findPath(
       start: Coordinates, 
       end: Coordinates, 
-      options: { maxIterations?: number } = {}
+      options: { maxIterations?: number; signal?: AbortSignal } = {}
   ): Promise<PathResult> {
     const startTime = performance.now();
+    
+    // Quick Abort Check
+    if (options.signal?.aborted) {
+        return { path: [], status: 'aborted' };
+    }
+
     const sIdx = this.toIndex(start.x, start.z);
     const eIdx = this.toIndex(end.x, end.z);
     const maxIter = options.maxIterations ?? this.defaultMaxIterations;
@@ -351,7 +365,6 @@ export class PathfindingService {
     }
 
     // Check Cache (LRU)
-    // Key now includes maxIterations to avoid returning partial/timeout paths for different constraints
     const cacheKey = `${sIdx}-${eIdx}-${maxIter}`;
     const cached = this.pathCache.get(cacheKey);
     if (cached && cached.version === this.gridVersion) {
@@ -370,7 +383,7 @@ export class PathfindingService {
     const buffers = this.acquireBuffers();
     
     try {
-        const result = this.calculateAStar(sIdx, eIdx, maxIter, buffers);
+        const result = this.calculateAStar(sIdx, eIdx, maxIter, buffers, options.signal);
         const duration = performance.now() - startTime;
         
         if (result.status === 'success') {
@@ -399,24 +412,40 @@ export class PathfindingService {
       startIdx: number, 
       endIdx: number, 
       maxIterations: number, 
-      buffers: ComputeBuffers
+      buffers: ComputeBuffers,
+      signal?: AbortSignal
   ): { path: Coordinates[], status: PathStatus, iterations: number } {
-    const { gScore, parentIndex, visited, heap, neighbors } = buffers;
+    const { gScore, parentIndex, closedSet, nodeState, heap, neighbors } = buffers;
 
-    // Reset logic (fast fill)
-    // Use Number.POSITIVE_INFINITY for clarity and consistency
-    gScore.fill(Number.POSITIVE_INFINITY);
-    parentIndex.fill(-1);
-    visited.fill(0);
+    // --- GENERATION BASED RESET (Lazy Init) ---
+    // Increment search ID. We use this to distinguish "fresh" nodes from old data
+    // without clearing the whole array (O(N) -> O(1)).
+    this.globalSearchId++;
+    // Handle potential overflow (very unlikely, but safe)
+    if (this.globalSearchId >= 0xFFFFFFFF) {
+        this.globalSearchId = 1;
+        nodeState.fill(0);
+        closedSet.fill(0);
+    }
+    const currentId = this.globalSearchId;
+
+    // Initialize Start Node
     heap.clear();
-    
     gScore[startIdx] = 0;
+    parentIndex[startIdx] = -1;
+    nodeState[startIdx] = currentId;
+    
     heap.push(startIdx, this.heuristic(startIdx, endIdx), 0);
 
     let iterations = 0;
 
     while (!heap.isEmpty()) {
       iterations++;
+      
+      if (signal?.aborted) {
+          return { path: [], status: 'aborted', iterations };
+      }
+
       if (iterations > maxIterations) {
           return { path: [], status: 'timeout', iterations };
       }
@@ -424,11 +453,18 @@ export class PathfindingService {
       const current = heap.pop()!;
       const currentIdx = current.index;
 
-      // Lazy Deletion
-      if (current.g > gScore[currentIdx]) continue;
+      // Lazy check if current node is valid for this search
+      // (It should be, because we only push to heap if initialized, 
+      // but standard lazy logic check applies for G score comparison)
+      // If nodeState != currentId, it means its gScore is conceptually Infinity.
+      const currentG = (nodeState[currentIdx] === currentId) ? gScore[currentIdx] : Infinity;
+
+      // Lazy Deletion / Stale path check
+      if (current.g > currentG) continue;
       
-      if (visited[currentIdx]) continue;
-      visited[currentIdx] = 1;
+      // Closed Set check
+      if (closedSet[currentIdx] === currentId) continue;
+      closedSet[currentIdx] = currentId;
 
       if (currentIdx === endIdx) {
         const path = this.reconstructPath(endIdx, parentIndex);
@@ -440,10 +476,18 @@ export class PathfindingService {
       for (let i = 0; i < count; i++) {
         const neighborIdx = neighbors[i];
         
-        if (visited[neighborIdx]) continue;
+        // Skip if in Closed Set for this search
+        if (closedSet[neighborIdx] === currentId) continue;
         
         const weight = this.grid[neighborIdx];
         if (!Number.isFinite(weight)) continue;
+
+        // Lazy Init Neighbor
+        if (nodeState[neighborIdx] !== currentId) {
+            gScore[neighborIdx] = Infinity;
+            parentIndex[neighborIdx] = -1;
+            nodeState[neighborIdx] = currentId;
+        }
 
         const tentativeG = current.g + weight;
 
@@ -463,13 +507,15 @@ export class PathfindingService {
   // --- Pool Management ---
 
   private createBuffers(size: number): ComputeBuffers {
-      // Dynamic initial capacity: Heuristic around 1/4 of map size or min 1024
-      const initialHeapCap = Math.max(1024, Math.floor(size / 4));
+      // Dynamic initial capacity: 
+      // Heuristic around 1/4 of map size, but min 16 (optimized for small maps).
+      const initialHeapCap = Math.max(16, (size / 4) | 0);
       
       return {
           gScore: new Float32Array(size),
           parentIndex: new Int32Array(size),
-          visited: new Uint8Array(size),
+          nodeState: new Uint32Array(size),
+          closedSet: new Uint32Array(size),
           heap: new FlatMinHeap(initialHeapCap),
           neighbors: new Int32Array(4)
       };
@@ -479,6 +525,14 @@ export class PathfindingService {
       if (this.bufferPool.length > 0) {
           return this.bufferPool.pop()!;
       }
+      
+      // Warn if we are exceeding the pool limit implicitely (creating new buffers on demand)
+      // This implies we have more parallel searches than maxPoolSize.
+      // We don't block, but we warn.
+      if (this.globalSearchId > 100) { // arbitrary threshold to avoid noise on init
+          console.warn(`[Pathfinding] Buffer pool exhausted. Allocating new buffers. Active searches > ${this.maxPoolSize}`);
+      }
+
       const totalTiles = this.size * this.size;
       return this.createBuffers(totalTiles);
   }
@@ -493,9 +547,12 @@ export class PathfindingService {
 
   private heuristic(aIdx: number, bIdx: number): number {
     const ax = aIdx % this.size;
-    const az = Math.floor(aIdx / this.size);
+    // Bitwise floor | 0
+    const az = (aIdx / this.size) | 0;
+    
     const bx = bIdx % this.size;
-    const bz = Math.floor(bIdx / this.size);
+    const bz = (bIdx / this.size) | 0;
+    
     // Use minStepCost to ensure admissibility
     return (Math.abs(ax - bx) + Math.abs(az - bz)) * this.minStepCost;
   }
@@ -504,9 +561,11 @@ export class PathfindingService {
     const path: Coordinates[] = [];
     let curr = endIdx;
     
-    while (parentIndex[curr] !== -1) {
+    // We trust that because we followed parent pointers set in THIS generation, 
+    // they are valid.
+    while (curr !== -1) {
       const gx = curr % this.size;
-      const gz = Math.floor(curr / this.size);
+      const gz = (curr / this.size) | 0;
       
       path.push({ 
         x: this.toWorldX(gx), 
@@ -514,14 +573,29 @@ export class PathfindingService {
       });
       
       curr = parentIndex[curr];
+      // Safety break for start node (which has parent -1)
+      // The logic above handles it, but just to be explicit:
+      // if (parentIndex[curr] === -1) break;
     }
     
-    return path.reverse();
+    // The path contains End -> ... -> Start.
+    // We want Start -> End? No, contract says "Excludes Start, Includes End".
+    // Current loop pushes End first.
+    // If we reverse, we get Start -> ... -> End.
+    // Then we pop Start? 
+    // Wait, the while loop runs until parentIndex is -1. Start node has parent -1.
+    // So Start node IS pushed last.
+    // We remove start node by popping.
+    
+    // Optimized: Reversing is O(N), but path is short.
+    path.reverse(); 
+    path.shift(); // Remove start node
+    return path;
   }
 
   private fillNeighborsBuffer(idx: number, buffer: Int32Array): number {
     const x = idx % this.size;
-    const z = Math.floor(idx / this.size);
+    const z = (idx / this.size) | 0;
     let count = 0;
 
     if (x > 0) buffer[count++] = idx - 1;
@@ -533,11 +607,11 @@ export class PathfindingService {
   }
 
   private toGridX(worldX: number): number {
-    return Math.round(worldX) + this.halfSize;
+    return (Math.round(worldX) + this.halfSize) | 0;
   }
 
   private toGridZ(worldZ: number): number {
-    return Math.round(worldZ) + this.halfSize;
+    return (Math.round(worldZ) + this.halfSize) | 0;
   }
 
   private toWorldX(gridX: number): number {
