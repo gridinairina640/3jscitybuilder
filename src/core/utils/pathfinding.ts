@@ -14,25 +14,35 @@ const CACHE_SIZE = 100;
 
 export type NavigationLayer = TileType | 'ROAD' | 'BUILDING';
 
+interface CacheEntry {
+  path: Coordinates[];
+  version: number;
+}
+
+interface HeapNode {
+  index: number;
+  f: number;
+}
+
 /**
  * MinHeap Implementation for high-performance Priority Queue.
- * Essential for A* speed (O(log n) insertions/removals).
+ * Optimized for A* pathfinding.
  */
-class MinHeap<T> {
-  private heap: T[];
-  private scoreFunction: (item: T) => number;
+class MinHeap {
+  private heap: HeapNode[];
+  private scoreFunction: (item: HeapNode) => number;
 
-  constructor(scoreFunction: (item: T) => number) {
+  constructor(scoreFunction: (item: HeapNode) => number) {
     this.heap = [];
     this.scoreFunction = scoreFunction;
   }
 
-  push(node: T) {
+  push(node: HeapNode) {
     this.heap.push(node);
     this.bubbleUp(this.heap.length - 1);
   }
 
-  pop(): T | undefined {
+  pop(): HeapNode | undefined {
     if (this.heap.length === 0) return undefined;
     const top = this.heap[0];
     const bottom = this.heap.pop();
@@ -97,12 +107,16 @@ class MinHeap<T> {
 /**
  * High-performance Pathfinding Service.
  * Uses 1D Float32Array for memory efficiency and O(1) access.
+ * Decoupled from rendering logic.
  */
 class PathfindingService {
   private width: number = 0;
   private height: number = 0;
+  private halfSize: number = 0;
+  
   private grid: Float32Array = new Float32Array(0); // Stores weights
-  private cache: Map<string, Coordinates[]> = new Map();
+  private cache: Map<string, CacheEntry> = new Map();
+  private gridVersion: number = 0; // Increments on every map change
 
   /**
    * Initializes the navigation grid from the game state.
@@ -110,53 +124,52 @@ class PathfindingService {
   public syncWithStore(tiles: TileData[], size: number) {
     this.width = size;
     this.height = size;
+    this.halfSize = Math.floor(size / 2);
     this.grid = new Float32Array(size * size);
     this.cache.clear();
+    this.gridVersion = 1;
 
-    // Populate grid
+    // Default init to Obstacle to catch out-of-bounds errors inside the array range
+    this.grid.fill(COSTS.OBSTACLE);
+
     tiles.forEach(tile => {
-      // Offset coordinates to array index (assuming map is centered 0,0)
-      // Map coordinates: -size/2 to size/2
-      // Array coordinates: 0 to size
-      const arrayX = tile.x + size / 2;
-      const arrayZ = tile.z + size / 2;
+      const arrayX = this.toGridX(tile.x);
+      const arrayZ = this.toGridZ(tile.z);
       
-      if (arrayX >= 0 && arrayX < size && arrayZ >= 0 && arrayZ < size) {
-        const index = arrayZ * size + arrayX;
-        this.grid[index] = this.getCostFromType(tile.type);
+      if (this.isValidGridIndex(arrayX, arrayZ)) {
+        const index = this.toIndex(arrayX, arrayZ);
         
-        // If occupied, mark as obstacle (unless we add dynamic unit collision later)
+        let weight = this.getCostFromType(tile.type);
         if (tile.occupiedBy) {
-          // We can check entity type here if needed, for now assume all buildings are obstacles
-          // But logic might be handled via updateNode separately
-           this.grid[index] = COSTS.OBSTACLE;
+           weight = COSTS.OBSTACLE;
         }
+        
+        this.grid[index] = weight;
       }
     });
   }
 
   /**
    * Updates a single node's walkability.
-   * O(1) complexity.
+   * O(1) complexity. Invalidates cache lazily via versioning.
    */
   public updateNode(x: number, z: number, type: NavigationLayer) {
-    const arrayX = x + this.width / 2;
-    const arrayZ = z + this.height / 2;
+    const arrayX = this.toGridX(x);
+    const arrayZ = this.toGridZ(z);
 
-    if (this.isValid(arrayX, arrayZ)) {
-      const index = arrayZ * this.width + arrayX;
+    if (this.isValidGridIndex(arrayX, arrayZ)) {
+      const index = this.toIndex(arrayX, arrayZ);
       let weight = COSTS.GRASS;
 
       if (type === 'ROAD') weight = COSTS.ROAD;
       else if (type === 'BUILDING') weight = COSTS.OBSTACLE;
       else weight = this.getCostFromType(type as TileType);
 
-      this.grid[index] = weight;
-      
-      // Invalidate relevant cache entries (naive approach: clear all)
-      // For a better approach, we'd only clear paths passing through this node, 
-      // but that's expensive to track.
-      this.cache.clear(); 
+      // Only update and bump version if weight actually changed
+      if (this.grid[index] !== weight) {
+        this.grid[index] = weight;
+        this.gridVersion++; 
+      }
     }
   }
 
@@ -165,50 +178,53 @@ class PathfindingService {
    * Useful for fast exits before calculating paths.
    */
   public isWalkable(x: number, z: number): boolean {
-    const arrayX = x + this.width / 2;
-    const arrayZ = z + this.height / 2;
+    const arrayX = this.toGridX(x);
+    const arrayZ = this.toGridZ(z);
     
-    if (!this.isValid(arrayX, arrayZ)) return false;
+    if (!this.isValidGridIndex(arrayX, arrayZ)) return false;
     
-    const index = arrayZ * this.width + arrayX;
-    return this.grid[index] !== COSTS.OBSTACLE && this.grid[index] !== Infinity;
+    const index = this.toIndex(arrayX, arrayZ);
+    return Number.isFinite(this.grid[index]);
   }
 
   /**
    * Async A* Pathfinding.
-   * Returns a promise to allow future offloading to Web Workers.
    */
   public async findPath(start: Coordinates, end: Coordinates): Promise<Coordinates[]> {
     const key = `${start.x},${start.z}:${end.x},${end.z}`;
     
-    // 1. Check LRU Cache
+    // 1. Check LRU Cache with Version Validation
     if (this.cache.has(key)) {
-      // Refresh key position for LRU
-      const path = this.cache.get(key)!;
-      this.cache.delete(key);
-      this.cache.set(key, path);
-      return path;
+      const entry = this.cache.get(key)!;
+      if (entry.version === this.gridVersion) {
+        // Refresh LRU position
+        this.cache.delete(key);
+        this.cache.set(key, entry);
+        return entry.path;
+      } else {
+        // Stale entry
+        this.cache.delete(key);
+      }
     }
 
-    // Convert world coords to grid coords
-    const sx = Math.round(start.x + this.width / 2);
-    const sz = Math.round(start.z + this.height / 2);
-    const ex = Math.round(end.x + this.width / 2);
-    const ez = Math.round(end.z + this.height / 2);
+    const sx = this.toGridX(start.x);
+    const sz = this.toGridZ(start.z);
+    const ex = this.toGridX(end.x);
+    const ez = this.toGridZ(end.z);
 
     // Boundary / Validity Checks
-    if (!this.isValid(sx, sz) || !this.isValid(ex, ez)) return [];
+    if (!this.isValidGridIndex(sx, sz) || !this.isValidGridIndex(ex, ez)) return [];
     
-    const startIndex = sz * this.width + sx;
-    const endIndex = ez * this.width + ex;
+    const startIndex = this.toIndex(sx, sz);
+    const endIndex = this.toIndex(ex, ez);
 
     // Check if end is reachable
-    if (this.grid[endIndex] === COSTS.OBSTACLE) return [];
+    if (!Number.isFinite(this.grid[endIndex])) return [];
 
     // --- A* Algorithm ---
-    const openSet = new MinHeap<{ index: number; f: number }>(n => n.f);
-    const cameFrom = new Map<number, number>(); // Child Index -> Parent Index
-    const gScore = new Map<number, number>(); // Index -> Cost
+    const openSet = new MinHeap(n => n.f);
+    const cameFrom = new Map<number, number>(); 
+    const gScore = new Map<number, number>(); 
 
     gScore.set(startIndex, 0);
     openSet.push({ index: startIndex, f: this.heuristic(sx, sz, ex, ez) });
@@ -218,15 +234,23 @@ class PathfindingService {
     while (openSet.size() > 0) {
       const current = openSet.pop();
       if (!current) break;
+      
       const currentIndex = current.index;
+
+      // Lazy Deletion / Duplicate Handling:
+      // If we found a path to this node that is shorter than what's recorded 
+      // when this node was pushed to heap, we've already processed it.
+      // However, since we don't store "what f was pushed", we check against known gScore.
+      // If current G is worse than what we already know, skip.
+      // Note: We calculate current G indirectly or rely on visited for simple graphs.
+      if (visited.has(currentIndex)) continue;
+      visited.add(currentIndex);
 
       if (currentIndex === endIndex) {
         const path = this.reconstructPath(cameFrom, currentIndex);
         this.addToCache(key, path);
         return path;
       }
-
-      visited.add(currentIndex);
 
       const cx = currentIndex % this.width;
       const cz = Math.floor(currentIndex / this.width);
@@ -240,12 +264,13 @@ class PathfindingService {
       ];
 
       for (const neighbor of neighbors) {
-        if (!this.isValid(neighbor.x, neighbor.z)) continue;
+        if (!this.isValidGridIndex(neighbor.x, neighbor.z)) continue;
         
-        const neighborIndex = neighbor.z * this.width + neighbor.x;
+        const neighborIndex = this.toIndex(neighbor.x, neighbor.z);
         const weight = this.grid[neighborIndex];
 
-        if (weight === COSTS.OBSTACLE) continue;
+        // Robust finite check
+        if (!Number.isFinite(weight)) continue;
         if (visited.has(neighborIndex)) continue;
 
         const tentativeG = (gScore.get(currentIndex) || 0) + weight;
@@ -253,6 +278,7 @@ class PathfindingService {
         if (tentativeG < (gScore.get(neighborIndex) ?? Infinity)) {
           cameFrom.set(neighborIndex, currentIndex);
           gScore.set(neighborIndex, tentativeG);
+          
           const f = tentativeG + this.heuristic(neighbor.x, neighbor.z, ex, ez);
           openSet.push({ index: neighborIndex, f });
         }
@@ -262,10 +288,30 @@ class PathfindingService {
     return []; // No path found
   }
 
-  // --- Helpers ---
+  // --- Coordinate & Helper Methods ---
 
-  private isValid(x: number, z: number): boolean {
-    return x >= 0 && x < this.width && z >= 0 && z < this.height;
+  private toGridX(worldX: number): number {
+    return Math.floor(worldX) + this.halfSize;
+  }
+
+  private toGridZ(worldZ: number): number {
+    return Math.floor(worldZ) + this.halfSize;
+  }
+
+  private toWorldX(gridX: number): number {
+    return gridX - this.halfSize;
+  }
+
+  private toWorldZ(gridZ: number): number {
+    return gridZ - this.halfSize;
+  }
+
+  private toIndex(gridX: number, gridZ: number): number {
+    return gridZ * this.width + gridX;
+  }
+
+  private isValidGridIndex(gx: number, gz: number): boolean {
+    return gx >= 0 && gx < this.width && gz >= 0 && gz < this.height;
   }
 
   private heuristic(x1: number, z1: number, x2: number, z2: number): number {
@@ -280,14 +326,17 @@ class PathfindingService {
     while (cameFrom.has(curr)) {
       const x = curr % this.width;
       const z = Math.floor(curr / this.width);
-      // Convert back to world coordinates
-      path.push({ x: x - this.width / 2, z: z - this.height / 2 });
+      
+      path.push({ 
+        x: this.toWorldX(x), 
+        z: this.toWorldZ(z) 
+      });
+      
       curr = cameFrom.get(curr)!;
     }
     
-    // Optional: Add start node? Usually movement systems want the *next* step, not where I am.
-    // path.push({ x: ... }) 
-
+    // Note: We exclude the start node. The unit is already there.
+    // The first element of the returned array is the *next* step.
     return path.reverse();
   }
 
@@ -296,7 +345,8 @@ class PathfindingService {
       const firstKey = this.cache.keys().next().value;
       if (firstKey) this.cache.delete(firstKey);
     }
-    this.cache.set(key, path);
+    // Store with current grid version
+    this.cache.set(key, { path, version: this.gridVersion });
   }
 
   private getCostFromType(type: TileType): number {

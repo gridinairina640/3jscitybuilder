@@ -32,3 +32,33 @@ export interface GameEvent {
   effect?: string;
   severity: 'GOOD' | 'BAD' | 'NEUTRAL';
 }
+
+// Augment JSX namespace for React Three Fiber elements to prevent type errors
+declare global {
+  namespace JSX {
+    interface IntrinsicElements {
+      // Core
+      group: any;
+      mesh: any;
+      instancedMesh: any;
+      
+      // Geometry
+      boxGeometry: any;
+      planeGeometry: any;
+      sphereGeometry: any;
+      coneGeometry: any;
+      cylinderGeometry: any;
+      ringGeometry: any;
+      
+      // Materials
+      meshStandardMaterial: any;
+      meshBasicMaterial: any;
+      
+      // Lights & Others
+      ambientLight: any;
+      directionalLight: any;
+      pointLight: any;
+      color: any;
+    }
+  }
+}
