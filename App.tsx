@@ -1,3 +1,10 @@
+/**
+ * @module App
+ * @layer Root
+ * @description Точка входа в приложение. 
+ * Инициализирует Canvas (R3F), освещение и управляет глобальным игровым циклом (ходы, события).
+ */
+
 import React, { useEffect, useState } from 'react';
 import { Canvas } from '@react-three/fiber';
 import { OrbitControls, Stars } from '@react-three/drei';

@@ -1,9 +1,21 @@
+/**
+ * @module Core/Economy
+ * @layer Core
+ * @description Чистая логика расчета экономики. Не зависит от React или Store.
+ */
+
 import { GameEntity, Resources } from '../../shared/types';
 import { BuildingType } from '../../entities/Buildings';
 
 /**
- * Calculates the resource changes for a new turn based on current entities.
- * Pure function: (Entities, CurrentResources) -> Partial<Resources>
+ * Рассчитывает изменения ресурсов за ход на основе списка сущностей.
+ * 
+ * @param entities Массив всех игровых сущностей.
+ * @returns {Partial<Resources>} Объект с дельтой ресурсов (например, { wood: 10 }).
+ * 
+ * @example
+ * const income = calculateTurnIncome(currentEntities);
+ * // income = { wood: 10, gold: 2 }
  */
 export const calculateTurnIncome = (entities: GameEntity[]): Partial<Resources> => {
   let woodGain = 0;

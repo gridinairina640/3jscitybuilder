@@ -1,3 +1,10 @@
+/**
+ * @module View/MapTerrain
+ * @layer View
+ * @description Отвечает за эффективный рендеринг местности.
+ * Использует InstancedMesh для отрисовки тысяч тайлов с минимальным количеством Draw Calls.
+ */
+
 import React, { useMemo, useLayoutEffect, useRef } from 'react';
 import * as THREE from 'three';
 import { TileData, TileType } from '../../entities/Map';
@@ -13,8 +20,11 @@ const ConeGeometry = new THREE.ConeGeometry(0.3, 0.8, 4);
 const CylinderGeometry = new THREE.CylinderGeometry(0.1, 0.1, 0.4);
 
 interface MapTerrainProps {
+  /** Все тайлы карты из Store */
   tiles: TileData[];
+  /** Колбек клика по тайлу */
   onTileClick: (x: number, z: number) => void;
+  /** Установка ховера */
   setHoveredTile: (coords: Coordinates | null) => void;
 }
 
@@ -28,6 +38,9 @@ interface InstancedLayerProps {
   yScale?: number;
 }
 
+/**
+ * Внутренний компонент для отрисовки одного слоя тайлов (например, только горы) через InstancedMesh.
+ */
 const InstancedLayer: React.FC<InstancedLayerProps> = ({ 
   tiles, geometry, material, onTileClick, setHoveredTile, yOffset = 0, yScale = 0.2 
 }) => {

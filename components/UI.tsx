@@ -1,3 +1,10 @@
+/**
+ * @module Components/UI
+ * @layer View
+ * @description Отвечает за 2D HUD интерфейс.
+ * Отображает ресурсы, панели строительства/найма и модальные окна событий.
+ */
+
 import React from 'react';
 import { Resources, GameEvent } from '../src/shared/types';
 import { BuildingType, BUILD_COSTS } from '../src/entities/Buildings';

@@ -1,114 +1,242 @@
+/**
+ * @module Core/Pathfinding
+ * @layer Core
+ * @description Высокопроизводительный сервис поиска пути (A*).
+ * Использует TypedArrays (Float32Array) для минимизации нагрузки на память и GC.
+ * 
+ * COORDINATE SYSTEM:
+ * - World Coordinates: Float or Integer, centered at (0,0). 1 unit = 1 tile.
+ * - Grid Coordinates: Integer indices [0..size-1].
+ * - Conversion: Grid = Math.round(World) + halfSize.
+ * 
+ * API CONTRACT:
+ * - findPath returns an array of coordinates EXCLUDING the start node.
+ * - If start === end, returns empty array.
+ * - If no path found, returns empty array.
+ */
 
 import { TileData, TileType } from '../../entities/Map';
 import { Coordinates } from '../../shared/types';
 
-// REFERENCE: High-performance A* Pathfinding (v2.1)
-// Mirroring the structure, error handling, and memory optimization guidelines.
+// REFERENCE: High-performance A* Pathfinding (v2.6)
+// Improvements (v2.6): 
+// - Reduced initial memory footprint (Heap capacity 1024 vs TotalTiles)
+// - LRU Cache Eviction Strategy
+// - Max Pool Size Limit
+// - Explicit API Documentation
 
 const COSTS = {
-  OBSTACLE: 0,
   ROAD: 0.5,
   GRASS: 1.0,
   FOREST: 1.5,
-  MIN_STEP: 0.5 // COSTS.ROAD
+  OBSTACLE: Infinity, 
+  MIN_STEP: 0.5 
 } as const;
 
 export type NavigationLayer = TileType | 'ROAD' | 'BUILDING';
 
-interface HeapNode {
-  index: number;
-  f: number;
-  g: number;
+const WEIGHT_MAP: Record<string, number> = {
+  'ROAD': COSTS.ROAD,
+  'GRASS': COSTS.GRASS,
+  'FOREST': COSTS.FOREST,
+  'WATER': COSTS.OBSTACLE,
+  'MOUNTAIN': COSTS.OBSTACLE,
+  'BUILDING': COSTS.OBSTACLE
+};
+
+/**
+ * Структура буферов, необходимых для одного вычисления A*.
+ */
+interface ComputeBuffers {
+  gScore: Float32Array;
+  parentIndex: Int32Array;
+  visited: Uint8Array;
+  heap: FlatMinHeap;
+  neighbors: Int32Array; // Fixed size 4 for Von Neumann neighborhood
 }
 
 /**
- * MinHeap Implementation for high-performance Priority Queue.
- * Optimized for A* pathfinding.
+ * Оптимизированная куча (MinHeap) на базе TypedArrays.
+ * Поддерживает авто-расширение и tie-breaking.
  */
-class MinHeap {
-  private heap: HeapNode[] = [];
-  
-  push(node: HeapNode) {
-    this.heap.push(node);
-    this.bubbleUp();
-  }
-  
-  pop(): HeapNode | undefined {
-    if (this.size() === 0) return undefined;
-    const top = this.heap[0];
-    const last = this.heap.pop()!;
-    if (this.size() > 0) {
-      this.heap[0] = last;
-      this.sinkDown();
-    }
-    return top;
-  }
-  
-  isEmpty() { return this.heap.length === 0; }
-  size() { return this.heap.length; }
+class FlatMinHeap {
+  private indices: Int32Array;
+  private f: Float32Array;
+  private g: Float32Array;
+  public length: number = 0;
 
-  private bubbleUp() {
-    let idx = this.heap.length - 1;
+  constructor(initialCapacity: number) {
+    this.indices = new Int32Array(initialCapacity);
+    this.f = new Float32Array(initialCapacity);
+    this.g = new Float32Array(initialCapacity);
+  }
+
+  push(index: number, fVal: number, gVal: number) {
+    if (this.length >= this.indices.length) {
+      this.resize();
+    }
+    this.indices[this.length] = index;
+    this.f[this.length] = fVal;
+    this.g[this.length] = gVal;
+    this.bubbleUp(this.length);
+    this.length++;
+  }
+
+  pop(): { index: number, g: number } | undefined {
+    if (this.length === 0) return undefined;
+
+    const topIndex = this.indices[0];
+    const topG = this.g[0];
+
+    this.length--;
+    if (this.length > 0) {
+      this.indices[0] = this.indices[this.length];
+      this.f[0] = this.f[this.length];
+      this.g[0] = this.g[this.length];
+      this.sinkDown(0);
+    }
+
+    return { index: topIndex, g: topG };
+  }
+
+  clear() {
+    this.length = 0;
+  }
+
+  isEmpty() {
+    return this.length === 0;
+  }
+
+  private resize() {
+    // Grow by 2x, min 16
+    const newCap = Math.max(this.indices.length * 2, 16);
+    const newInd = new Int32Array(newCap);
+    const newF = new Float32Array(newCap);
+    const newG = new Float32Array(newCap);
+    
+    newInd.set(this.indices);
+    newF.set(this.f);
+    newG.set(this.g);
+    
+    this.indices = newInd;
+    this.f = newF;
+    this.g = newG;
+  }
+
+  private bubbleUp(idx: number) {
     while (idx > 0) {
-      let parentIdx = Math.floor((idx - 1) / 2);
-      if (this.heap[idx].f >= this.heap[parentIdx].f) break;
-      [this.heap[idx], this.heap[parentIdx]] = [this.heap[parentIdx], this.heap[idx]];
+      const parentIdx = (idx - 1) >>> 1;
+      
+      const cf = this.f[idx];
+      const pf = this.f[parentIdx];
+      
+      // MinHeap property: Parent must be smaller. If Child > Parent, order is correct.
+      if (cf > pf) break;
+      
+      // Tie-breaking: If F is equal, prefer HIGHER G (closer to target in reliable heuristics)
+      // So if Child G <= Parent G, it's not "better", so we stop.
+      if (cf === pf && this.g[idx] <= this.g[parentIdx]) break;
+      
+      this.swap(idx, parentIdx);
       idx = parentIdx;
     }
   }
 
-  private sinkDown() {
-    let idx = 0;
-    while (true) {
-      let left = 2 * idx + 1;
-      let right = 2 * idx + 2;
-      let smallest = idx;
-      if (left < this.heap.length && this.heap[left].f < this.heap[smallest].f) smallest = left;
-      if (right < this.heap.length && this.heap[right].f < this.heap[smallest].f) smallest = right;
-      if (smallest === idx) break;
-      [this.heap[idx], this.heap[smallest]] = [this.heap[smallest], this.heap[idx]];
-      idx = smallest;
+  private sinkDown(idx: number) {
+    const halfLen = this.length >>> 1;
+    while (idx < halfLen) {
+      let left = (idx << 1) + 1;
+      let right = left + 1;
+      let best = idx;
+
+      const bf = this.f[best];
+      const lf = this.f[left];
+
+      // Check Left
+      let swapLeft = false;
+      if (lf < bf) {
+          swapLeft = true;
+      } else if (lf === bf && this.g[left] > this.g[best]) {
+          swapLeft = true;
+      }
+
+      if (swapLeft) best = left;
+
+      // Check Right
+      if (right < this.length) {
+          const rf = this.f[right];
+          const bestF = this.f[best];
+          
+          let swapRight = false;
+          if (rf < bestF) {
+              swapRight = true;
+          } else if (rf === bestF && this.g[right] > this.g[best]) {
+              swapRight = true;
+          }
+          
+          if (swapRight) best = right;
+      }
+
+      if (best === idx) break;
+
+      this.swap(idx, best);
+      idx = best;
     }
+  }
+
+  private swap(i: number, j: number) {
+    const tempI = this.indices[i];
+    const tempF = this.f[i];
+    const tempG = this.g[i];
+
+    this.indices[i] = this.indices[j];
+    this.f[i] = this.f[j];
+    this.g[i] = this.g[j];
+
+    this.indices[j] = tempI;
+    this.f[j] = tempF;
+    this.g[j] = tempG;
   }
 }
 
 /**
- * High-performance Pathfinding Service.
- * Uses 1D Float32Array for memory efficiency and O(1) access.
- * Decoupled from rendering logic.
+ * Синглтон-сервис для навигации.
+ * Хранит карту весов и пул буферов для параллельных вычислений.
  */
 export class PathfindingService {
   private grid: Float32Array;
   private size: number = 0;
   private halfSize: number = 0;
   private gridVersion: number = 0;
-  private pathCache: Map<string, { path: Coordinates[]; version: number }> = new Map();
   
-  // Reusable buffers to minimize GC pressure
-  private gScore!: Float32Array;
-  private parentIndex!: Int32Array;
-  private visited!: Uint8Array;
-  private maxIterations: number = 5000;
+  // Cache uses LRU strategy (via Map insertion order)
+  private pathCache: Map<string, { path: Coordinates[]; version: number }> = new Map();
+  private maxCacheSize: number = 2000;
+  
+  // Buffer Pool for Thread Safety (Reentrancy)
+  private bufferPool: ComputeBuffers[] = [];
+  private maxPoolSize: number = 4;
+  
+  private defaultMaxIterations: number = 10000;
 
   constructor() {
     this.grid = new Float32Array(0);
   }
 
   /**
-   * Initializes the navigation grid from the game state.
+   * Инициализирует навигационную сетку.
+   * Очищает пул буферов, так как размер карты изменился.
    */
   public syncWithStore(tiles: TileData[], size: number): void {
     this.size = size;
     this.halfSize = Math.floor(size / 2);
+    
     const totalTiles = size * size;
     
-    // Allocate buffers once
-    this.grid = new Float32Array(totalTiles);
-    this.gScore = new Float32Array(totalTiles);
-    this.parentIndex = new Int32Array(totalTiles);
-    this.visited = new Uint8Array(totalTiles);
-    
-    // Default to OBSTACLE for safety
+    // 1. Setup Grid
+    if (this.grid.length !== totalTiles) {
+        this.grid = new Float32Array(totalTiles);
+    }
     this.grid.fill(COSTS.OBSTACLE);
 
     tiles.forEach(tile => {
@@ -120,19 +248,22 @@ export class PathfindingService {
       }
     });
 
+    // 2. Reset Buffer Pool (Invalidate old buffers)
+    this.bufferPool = [];
+    
+    // 3. Reset Cache
     this.gridVersion++;
     this.pathCache.clear();
   }
 
-  /**
-   * Updates a single node's walkability.
-   * O(1) complexity. Invalidates cache lazily via versioning.
-   */
-  public updateNode(x: number, z: number, type: NavigationLayer): void {
+  public updateNode(x: number, z: number, type: NavigationLayer, occupied: boolean = false): void {
     const idx = this.toIndex(x, z);
     if (idx === -1) return;
     
-    const weight = this.getWeightByType(type);
+    let weight = this.getWeightByType(type);
+    if (occupied) {
+        weight = COSTS.OBSTACLE;
+    }
     
     if (this.grid[idx] !== weight) {
        this.grid[idx] = weight;
@@ -140,83 +271,118 @@ export class PathfindingService {
     }
   }
 
-  /**
-   * Checks if a tile is walkable.
-   * Useful for fast exits before calculating paths.
-   */
   public isWalkable(x: number, z: number): boolean {
     const idx = this.toIndex(x, z);
     if (idx === -1) return false;
-    return this.grid[idx] !== COSTS.OBSTACLE;
+    return Number.isFinite(this.grid[idx]);
   }
 
   /**
-   * Async A* Pathfinding.
+   * Finds a path from start to end.
+   * @param start World coordinates of start position
+   * @param end World coordinates of target position
+   * @param options Configuration options
+   * @returns Array of coordinates representing the path, EXCLUDING the start node.
    */
-  public async findPath(start: Coordinates, end: Coordinates): Promise<Coordinates[]> {
+  public async findPath(
+      start: Coordinates, 
+      end: Coordinates, 
+      options: { maxIterations?: number } = {}
+  ): Promise<Coordinates[]> {
     const sIdx = this.toIndex(start.x, start.z);
     const eIdx = this.toIndex(end.x, end.z);
 
-    // Fail Fast: Out of bounds or same position
+    // Fail Fast
     if (sIdx === -1 || eIdx === -1) return [];
     if (sIdx === eIdx) return [];
+    if (!Number.isFinite(this.grid[sIdx]) || !Number.isFinite(this.grid[eIdx])) return [];
 
-    // Fail Fast: Start or End is unreachable
-    if (this.grid[sIdx] === COSTS.OBSTACLE || this.grid[eIdx] === COSTS.OBSTACLE) return [];
-
+    // Check Cache (LRU)
     const cacheKey = `${sIdx}-${eIdx}`;
     const cached = this.pathCache.get(cacheKey);
-    if (cached && cached.version === this.gridVersion) return cached.path;
-
-    const result = this.calculateAStar(sIdx, eIdx);
-    
-    if (result.length > 0) {
-      this.pathCache.set(cacheKey, { path: result, version: this.gridVersion });
+    if (cached && cached.version === this.gridVersion) {
+        // Refresh: remove and re-insert to mark as recently used
+        this.pathCache.delete(cacheKey);
+        this.pathCache.set(cacheKey, cached);
+        return cached.path;
     }
+
+    // Acquire Buffers
+    const buffers = this.acquireBuffers();
     
-    return result;
+    try {
+        const maxIter = options.maxIterations ?? this.defaultMaxIterations;
+        const result = this.calculateAStar(sIdx, eIdx, maxIter, buffers);
+        
+        if (result.length > 0) {
+          // Cache Maintenance (LRU Eviction)
+          if (this.pathCache.size >= this.maxCacheSize) {
+              // Map.keys() returns iterator in insertion order. First item is oldest.
+              const oldestKey = this.pathCache.keys().next().value;
+              if (oldestKey) this.pathCache.delete(oldestKey);
+          }
+          this.pathCache.set(cacheKey, { path: result, version: this.gridVersion });
+        }
+        
+        return result;
+    } finally {
+        this.releaseBuffers(buffers);
+    }
   }
 
-  private calculateAStar(startIdx: number, endIdx: number): Coordinates[] {
-    // Reset buffers
-    this.gScore.fill(Infinity);
-    this.parentIndex.fill(-1);
-    this.visited.fill(0);
+  private calculateAStar(
+      startIdx: number, 
+      endIdx: number, 
+      maxIterations: number, 
+      buffers: ComputeBuffers
+  ): Coordinates[] {
+    const { gScore, parentIndex, visited, heap, neighbors } = buffers;
+
+    // Reset logic (fast fill)
+    gScore.fill(Infinity);
+    parentIndex.fill(-1);
+    visited.fill(0);
+    heap.clear();
     
-    const openSet = new MinHeap();
-    
-    this.gScore[startIdx] = 0;
-    openSet.push({ index: startIdx, f: this.heuristic(startIdx, endIdx), g: 0 });
+    gScore[startIdx] = 0;
+    heap.push(startIdx, this.heuristic(startIdx, endIdx), 0);
 
     let iterations = 0;
 
-    while (!openSet.isEmpty() && iterations < this.maxIterations) {
+    while (!heap.isEmpty()) {
       iterations++;
-      const current = openSet.pop()!;
+      if (iterations > maxIterations) return [];
 
-      // Lazy Deletion: Skip if we found a better path to this node already
-      if (current.g > this.gScore[current.index]) continue;
-      if (this.visited[current.index]) continue;
+      const current = heap.pop()!;
+      const currentIdx = current.index;
+
+      // Lazy Deletion
+      if (current.g > gScore[currentIdx]) continue;
       
-      this.visited[current.index] = 1;
+      if (visited[currentIdx]) continue;
+      visited[currentIdx] = 1;
 
-      if (current.index === endIdx) {
-        return this.reconstructPath(endIdx);
+      if (currentIdx === endIdx) {
+        return this.reconstructPath(endIdx, parentIndex);
       }
 
-      for (const neighborIdx of this.getNeighbors(current.index)) {
-        if (this.visited[neighborIdx]) continue;
+      const count = this.fillNeighborsBuffer(currentIdx, neighbors);
+      
+      for (let i = 0; i < count; i++) {
+        const neighborIdx = neighbors[i];
+        
+        if (visited[neighborIdx]) continue;
         
         const weight = this.grid[neighborIdx];
-        if (weight === COSTS.OBSTACLE) continue;
+        if (!Number.isFinite(weight)) continue;
 
         const tentativeG = current.g + weight;
 
-        if (tentativeG < this.gScore[neighborIdx]) {
-          this.parentIndex[neighborIdx] = current.index;
-          this.gScore[neighborIdx] = tentativeG;
+        if (tentativeG < gScore[neighborIdx]) {
+          parentIndex[neighborIdx] = currentIdx;
+          gScore[neighborIdx] = tentativeG;
           const f = tentativeG + this.heuristic(neighborIdx, endIdx);
-          openSet.push({ index: neighborIdx, f, g: tentativeG });
+          heap.push(neighborIdx, f, tentativeG);
         }
       }
     }
@@ -224,68 +390,117 @@ export class PathfindingService {
     return [];
   }
 
+  // --- Pool Management ---
+
+  private createBuffers(size: number): ComputeBuffers {
+      // Small initial capacity for heap to save memory. 
+      // It will resize automatically if path is complex.
+      const initialHeapCap = 1024; 
+      
+      return {
+          gScore: new Float32Array(size),
+          parentIndex: new Int32Array(size),
+          visited: new Uint8Array(size),
+          heap: new FlatMinHeap(initialHeapCap),
+          neighbors: new Int32Array(4)
+      };
+  }
+
+  private acquireBuffers(): ComputeBuffers {
+      if (this.bufferPool.length > 0) {
+          return this.bufferPool.pop()!;
+      }
+      // Create new if pool empty or exhausted
+      const totalTiles = this.size * this.size;
+      return this.createBuffers(totalTiles);
+  }
+
+  private releaseBuffers(buffers: ComputeBuffers) {
+      if (this.bufferPool.length < this.maxPoolSize) {
+          this.bufferPool.push(buffers);
+      }
+      // If pool is full, let GC collect these buffers
+  }
+
+  // --- Helpers ---
+
   private heuristic(aIdx: number, bIdx: number): number {
     const ax = aIdx % this.size;
     const az = Math.floor(aIdx / this.size);
     const bx = bIdx % this.size;
     const bz = Math.floor(bIdx / this.size);
-    // Admissible heuristic: Manhattan scaled by MIN_STEP cost
     return (Math.abs(ax - bx) + Math.abs(az - bz)) * COSTS.MIN_STEP;
   }
 
-  private reconstructPath(endIdx: number): Coordinates[] {
+  private reconstructPath(endIdx: number, parentIndex: Int32Array): Coordinates[] {
     const path: Coordinates[] = [];
     let curr = endIdx;
     
-    // Build path backwards, excluding the start node
-    while (this.parentIndex[curr] !== -1) {
+    // Standard reconstruction: Stop when we reach start node (parent is -1)
+    // This results in a path that excludes the start node.
+    while (parentIndex[curr] !== -1) {
       const gx = curr % this.size;
       const gz = Math.floor(curr / this.size);
       
-      // Convert back to world coordinates
       path.push({ 
-        x: gx - this.halfSize, 
-        z: gz - this.halfSize 
+        x: this.toWorldX(gx), 
+        z: this.toWorldZ(gz) 
       });
       
-      curr = this.parentIndex[curr];
+      curr = parentIndex[curr];
     }
     
     return path.reverse();
   }
 
-  private getNeighbors(idx: number): number[] {
+  private fillNeighborsBuffer(idx: number, buffer: Int32Array): number {
     const x = idx % this.size;
     const z = Math.floor(idx / this.size);
-    const res: number[] = [];
+    let count = 0;
 
-    if (x > 0) res.push(idx - 1);
-    if (x < this.size - 1) res.push(idx + 1);
-    if (z > 0) res.push(idx - this.size);
-    if (z < this.size - 1) res.push(idx + this.size);
+    if (x > 0) buffer[count++] = idx - 1;
+    if (x < this.size - 1) buffer[count++] = idx + 1;
+    if (z > 0) buffer[count++] = idx - this.size;
+    if (z < this.size - 1) buffer[count++] = idx + this.size;
 
-    return res;
+    return count;
+  }
+
+  /**
+   * Converts world X to grid index.
+   * Strategy: Round to nearest integer.
+   * -0.4 -> 0
+   * 0.4 -> 0
+   * 0.6 -> 1
+   */
+  private toGridX(worldX: number): number {
+    return Math.round(worldX) + this.halfSize;
+  }
+
+  private toGridZ(worldZ: number): number {
+    return Math.round(worldZ) + this.halfSize;
+  }
+
+  private toWorldX(gridX: number): number {
+    return gridX - this.halfSize;
+  }
+
+  private toWorldZ(gridZ: number): number {
+    return gridZ - this.halfSize;
   }
 
   private toIndex(worldX: number, worldZ: number): number {
-    // Using Math.round because tiles are centered at integer coordinates (0,0) ranges [-0.5, 0.5]
-    // Math.round ensures we pick the nearest tile center.
-    const gx = Math.round(worldX) + this.halfSize;
-    const gz = Math.round(worldZ) + this.halfSize;
+    const gx = this.toGridX(worldX);
+    const gz = this.toGridZ(worldZ);
     
     if (gx < 0 || gx >= this.size || gz < 0 || gz >= this.size) return -1;
     return gz * this.size + gx;
   }
 
-  private getWeightByType(type: string): number {
-    switch (type.toUpperCase()) {
-      case 'ROAD': return COSTS.ROAD;
-      case 'FOREST': return COSTS.FOREST;
-      case 'WATER': 
-      case 'MOUNTAIN': 
-      case 'BUILDING': return COSTS.OBSTACLE;
-      default: return COSTS.GRASS;
-    }
+  private getWeightByType(type: NavigationLayer): number {
+    // Ensure strict string conversion for safety if type is ever passed incorrectly
+    const t = String(type).toUpperCase();
+    return WEIGHT_MAP[t] ?? COSTS.GRASS;
   }
 }
 

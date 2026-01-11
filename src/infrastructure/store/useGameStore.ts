@@ -1,3 +1,10 @@
+/**
+ * @module Infrastructure/Store
+ * @layer Infrastructure
+ * @description Центральное хранилище состояния (Single Source of Truth).
+ * Реализовано на Zustand. Связывает Actions с Core Logic.
+ */
+
 import { create } from 'zustand';
 import { v4 as uuidv4 } from 'uuid';
 import { TileData, TileType } from '../../entities/Map';
@@ -8,27 +15,64 @@ import { calculateTurnIncome } from '../../core/systems/EconomySystem';
 import { pathfindingService } from '../../core/utils/pathfinding';
 
 interface GameState {
-  // State
+  // --- State ---
+  /** Массив всех тайлов карты */
   tiles: TileData[];
+  /** Массив всех активных сущностей (здания, юниты) */
   entities: GameEntity[];
+  /** Текущие ресурсы игрока */
   resources: Resources;
+  /** Номер текущего хода */
   turn: number;
+  /** Последнее активное событие */
   lastEvent: GameEvent | null;
+  /** Выбранный режим строительства */
   selectedBuildMode: BuildingType | null;
+  /** Выбранный режим найма */
   selectedUnitMode: UnitType | null;
+  /** Координаты тайла под курсором */
   hoveredTile: Coordinates | null;
   
-  // Actions
+  // --- Actions ---
+  
+  /**
+   * Инициализирует новую игру, генерирует карту и синхронизирует навигацию.
+   * @param size Размер сетки (например, 50).
+   */
   initGame: (size: number) => void;
+  
+  /** Устанавливает тайл под курсором */
   setHoveredTile: (coords: Coordinates | null) => void;
+  /** Включает режим строительства */
   setBuildMode: (mode: BuildingType | null) => void;
+  /** Включает режим найма */
   setUnitMode: (mode: UnitType | null) => void;
+  /** Устанавливает активное событие */
   setLastEvent: (event: GameEvent | null) => void;
   
-  // Gameplay Actions
+  // --- Gameplay Actions ---
+  
+  /**
+   * Пытается построить здание в указанных координатах.
+   * Проверяет ресурсы, валидность тайла и обновляет навигационную сетку.
+   */
   buildEntity: (x: number, z: number) => void;
+  
+  /**
+   * Нанимает юнита в указанной точке.
+   */
   recruitUnit: (x: number, z: number) => void;
+  
+  /**
+   * Задает цель движения для юнита. Запускает асинхронный поиск пути.
+   * @async
+   */
   setUnitTarget: (unitId: string, x: number, z: number) => Promise<void>;
+  
+  /**
+   * Завершает ход. Перемещает юнитов, рассчитывает доход и применяет события.
+   * @param eventEffect Опциональная функция влияния события на ресурсы.
+   */
   nextTurn: (eventEffect?: (current: Resources) => Partial<Resources>) => void;
 }
 

@@ -1,3 +1,11 @@
+/**
+ * @module Components/GameMap
+ * @layer View
+ * @description Корневой компонент 3D-сцены.
+ * Связывает Zustand Store с визуальными компонентами (MapTerrain, BuildingRenderer).
+ * Обрабатывает пользовательский ввод в 3D пространстве.
+ */
+
 import React from 'react';
 import * as THREE from 'three';
 import { useGameStore } from '../src/infrastructure/store/useGameStore';

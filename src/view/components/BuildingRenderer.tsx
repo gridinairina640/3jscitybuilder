@@ -1,3 +1,10 @@
+/**
+ * @module View/BuildingRenderer
+ * @layer View
+ * @description Отвечает за отрисовку динамических игровых сущностей (зданий, юнитов).
+ * В отличие от террейна, здесь используется обычный Mesh, так как объекты меняются часто.
+ */
+
 import React from 'react';
 import * as THREE from 'three';
 import { GameEntity } from '../../shared/types';
@@ -5,6 +12,7 @@ import { BuildingType } from '../../entities/Buildings';
 import { UnitType } from '../../entities/Units';
 
 interface BuildingRendererProps {
+  /** Список всех активных сущностей для рендера */
   entities: GameEntity[];
 }
 
