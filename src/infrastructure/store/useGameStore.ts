@@ -204,10 +204,9 @@ export const useGameStore = create<GameState>((set, get) => ({
   },
 
   setUnitTarget: async (unitId: string, x: number, z: number) => {
-      if (!pathfindingService.isWalkable(x, z)) {
-          return;
-      }
-
+      // NOTE: We don't check isWalkable here anymore because findPath
+      // with failToClosest: true handles unreachable targets.
+      
       const { entities } = get();
       const unit = entities.find(e => e.id === unitId);
       if (!unit) return;
@@ -219,9 +218,14 @@ export const useGameStore = create<GameState>((set, get) => ({
       }));
 
       try {
-          const result = await pathfindingService.findPath(unit.position, { x, z });
+          // Enable failToClosest for better UX (RTS style movement)
+          const result = await pathfindingService.findPath(
+              unit.position, 
+              { x, z }, 
+              { failToClosest: true }
+          );
           
-          if (result.status === 'success') {
+          if (result.status === 'success' || result.status === 'partial_path') {
             set(state => ({
                 entities: state.entities.map(e => 
                     e.id === unitId ? { 

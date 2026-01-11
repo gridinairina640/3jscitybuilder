@@ -18,11 +18,11 @@
 import { TileData, TileType } from '../../entities/Map';
 import { Coordinates } from '../../shared/types';
 
-// REFERENCE: High-performance A* Pathfinding (v3.3.0)
-// Improvements (v3.3.0): 
-// - Added 'includeStartNode' option
-// - Fixed minStepCost to constant to ensure strict admissibility and stability
-// - Refined updateNode logic (removed dynamic minStepCost updates)
+// REFERENCE: High-performance A* Pathfinding (v3.5.0)
+// Improvements (v3.5.0): 
+// - Fixed tentativeG calculation to use gScore source of truth
+// - Added 'failToClosest' option (RTS-style movement to unreachable targets)
+// - Relaxed target walkability checks when failToClosest is enabled
 
 const COSTS = {
   ROAD: 0.5,
@@ -47,7 +47,7 @@ const WEIGHT_MAP: Record<NavigationLayer | string, number> = {
   'BUILDING': COSTS.OBSTACLE
 };
 
-export type PathStatus = 'success' | 'no_path' | 'timeout' | 'invalid_args' | 'aborted';
+export type PathStatus = 'success' | 'no_path' | 'timeout' | 'invalid_args' | 'aborted' | 'partial_path';
 
 export interface PathResult {
   path: Coordinates[];
@@ -56,6 +56,7 @@ export interface PathResult {
     iterations: number;
     duration: number;
     cached?: boolean;
+    isPartial?: boolean;
   };
 }
 
@@ -64,7 +65,10 @@ export interface PathOptions {
   signal?: AbortSignal;
   heuristicWeight?: number; // > 1.0 for faster, greedy search
   includeStartNode?: boolean; // If true, the path includes the start coordinates
+  failToClosest?: boolean; // If target is unreachable, return path to the closest reachable node
 }
+
+const MAX_NEIGHBORS = 4;
 
 /**
  * Структура буферов, необходимых для одного вычисления A*.
@@ -166,9 +170,7 @@ class FlatMinHeap {
       if (cf > pf + EPSILON) break;
       
       // Tie-breaking:
-      // If F is roughly equal, we prioritize nodes with HIGHER G (closer to target in a reliable metric).
-      // Logic: if Child.G > Parent.G -> Child is better -> Swap.
-      // Here we check if Child is WORSE or EQUAL (Child.G <= Parent.G), then we stop.
+      // If F is roughly equal, we prioritize nodes with HIGHER G (closer to target).
       if (Math.abs(cf - pf) < EPSILON) {
          if (this.g[idx] <= this.g[parentIdx]) break;
       }
@@ -191,10 +193,8 @@ class FlatMinHeap {
       // Check Left
       let swapLeft = false;
       if (lf < bf - EPSILON) { 
-          // Strictly smaller F -> Better
           swapLeft = true;
       } else if (Math.abs(lf - bf) < EPSILON && this.g[left] > this.g[best]) {
-          // Equal F, but Higher G -> Better (Closer to target)
           swapLeft = true;
       }
 
@@ -248,19 +248,17 @@ export class PathfindingService {
   private halfSize: number = 0;
   private gridVersion: number = 0;
   
-  // Fixed min step cost to ensure admissibility and avoid dynamic update issues.
-  // 0.5 corresponds to ROAD, which is typically the cheapest terrain.
+  // Fixed min step cost to ensure admissibility
   private readonly minStepCost: number = COSTS.MIN_STEP;
   
   // Tracks global search generation to allow O(1) buffer reset
   private globalSearchId: number = 0;
   
-  // Cache uses LRU strategy (via Map insertion order)
+  // Cache uses LRU strategy
   private pathCache: Map<string, { path: Coordinates[]; version: number }> = new Map();
   private maxCacheSize: number = 2000;
   
   // Buffer Pool for Thread Safety (Reentrancy)
-  // NOTE: This pool is NOT thread-safe for multi-threaded environments (Workers).
   private bufferPool: ComputeBuffers[] = [];
   private maxPoolSize: number = 4;
   
@@ -330,10 +328,6 @@ export class PathfindingService {
 
   /**
    * Finds a path from start to end.
-   * @param start World coordinates of start position
-   * @param end World coordinates of target position
-   * @param options Configuration options
-   * @returns PathResult object containing status and path.
    */
   public async findPath(
       start: Coordinates, 
@@ -342,7 +336,6 @@ export class PathfindingService {
   ): Promise<PathResult> {
     const startTime = performance.now();
     
-    // Quick Abort Check
     if (options.signal?.aborted) {
         return { path: [], status: 'aborted' };
     }
@@ -352,21 +345,27 @@ export class PathfindingService {
     const maxIter = options.maxIterations ?? this.defaultMaxIterations;
     const hWeight = options.heuristicWeight ?? 1.0;
     const includeStart = options.includeStartNode ?? false;
+    const failToClosest = options.failToClosest ?? false;
 
     // Fail Fast
     if (sIdx === -1 || eIdx === -1) {
         return { path: [], status: 'invalid_args' };
     }
+    
+    // Check if Start == End
     if (sIdx === eIdx) {
-        return { path: [], status: 'success', metrics: { iterations: 0, duration: 0 } };
+        const path = includeStart ? [{ ...end }] : [];
+        return { path, status: 'success', metrics: { iterations: 0, duration: 0 } };
     }
-    if (!Number.isFinite(this.grid[sIdx]) || !Number.isFinite(this.grid[eIdx])) {
-        return { path: [], status: 'no_path' };
-    }
+    
+    // Walkability Checks
+    // If failToClosest is TRUE, we allow invalid eIdx because we might want to get CLOSE to it.
+    if (!Number.isFinite(this.grid[sIdx])) return { path: [], status: 'no_path' };
+    if (!failToClosest && !Number.isFinite(this.grid[eIdx])) return { path: [], status: 'no_path' };
 
     // Check Cache (LRU)
-    // Cache Key includes weight, iter and includeStart to ensure correctness
-    const cacheKey = `${sIdx}-${eIdx}-${maxIter}-${hWeight}-${includeStart}`;
+    // Cache Key must include failToClosest
+    const cacheKey = `${sIdx}-${eIdx}-${maxIter}-${hWeight}-${includeStart}-${failToClosest}`;
     const cached = this.pathCache.get(cacheKey);
     if (cached && cached.version === this.gridVersion) {
         const duration = performance.now() - startTime;
@@ -380,14 +379,17 @@ export class PathfindingService {
         };
     }
 
-    // Acquire Buffers (Synchronous checkout)
+    // Acquire Buffers
     const buffers = this.acquireBuffers();
     
     try {
-        const result = this.calculateAStar(sIdx, eIdx, maxIter, hWeight, includeStart, buffers, options.signal);
+        const result = this.calculateAStar(
+            sIdx, eIdx, maxIter, hWeight, includeStart, failToClosest, 
+            buffers, options.signal
+        );
         const duration = performance.now() - startTime;
         
-        if (result.status === 'success') {
+        if (result.status === 'success' || result.status === 'partial_path') {
           // Cache Maintenance (LRU Eviction)
           if (this.pathCache.size >= this.maxCacheSize) {
               const oldestKey = this.pathCache.keys().next().value;
@@ -401,7 +403,8 @@ export class PathfindingService {
             metrics: {
                 iterations: result.iterations,
                 duration,
-                cached: false
+                cached: false,
+                isPartial: result.status === 'partial_path'
             }
         };
     } finally {
@@ -415,6 +418,7 @@ export class PathfindingService {
       maxIterations: number,
       heuristicWeight: number,
       includeStart: boolean,
+      failToClosest: boolean,
       buffers: ComputeBuffers,
       signal?: AbortSignal
   ): { path: Coordinates[], status: PathStatus, iterations: number } {
@@ -435,30 +439,37 @@ export class PathfindingService {
     parentIndex[startIdx] = -1;
     nodeState[startIdx] = currentId;
     
-    // F = G + H * Weight
     heap.push(startIdx, this.heuristic(startIdx, endIdx) * heuristicWeight, 0);
 
     let iterations = 0;
+    
+    // Tracking for failToClosest
+    let closestNodeIdx = startIdx;
+    let minH = Infinity;
 
     while (!heap.isEmpty()) {
       iterations++;
       
-      if (signal?.aborted) {
-          return { path: [], status: 'aborted', iterations };
-      }
-
-      if (iterations > maxIterations) {
-          return { path: [], status: 'timeout', iterations };
-      }
+      if (signal?.aborted) return { path: [], status: 'aborted', iterations };
+      if (iterations > maxIterations) break; // Will handle as fail/closest below
 
       const current = heap.pop()!;
       const currentIdx = current.index;
 
+      // Lazy check: if we found a better G for this node already, skip
       const currentG = (nodeState[currentIdx] === currentId) ? gScore[currentIdx] : Infinity;
-
-      // Lazy Deletion
       if (current.g > currentG) continue;
       
+      // Update closest node (Min H to target)
+      if (failToClosest) {
+          // Note: Heuristic uses simple Manhattan
+          const h = this.heuristic(currentIdx, endIdx);
+          if (h < minH) {
+              minH = h;
+              closestNodeIdx = currentIdx;
+          }
+      }
+
       // Closed Set check
       if (closedSet[currentIdx] === currentId) continue;
       closedSet[currentIdx] = currentId;
@@ -484,20 +495,27 @@ export class PathfindingService {
             nodeState[neighborIdx] = currentId;
         }
 
-        const tentativeG = current.g + weight;
+        // CRITICAL FIX: Use currentG (from array source of truth) + weight
+        const tentativeG = currentG + weight;
 
         // Strict Check
         if (tentativeG < gScore[neighborIdx]) {
           parentIndex[neighborIdx] = currentIdx;
           gScore[neighborIdx] = tentativeG;
-          // Weighted A* Heuristic application
           const f = tentativeG + (this.heuristic(neighborIdx, endIdx) * heuristicWeight);
           heap.push(neighborIdx, f, tentativeG);
         }
       }
     }
+    
+    // Path not found or timeout
+    if (failToClosest) {
+         // Return path to the node that got closest to the target
+         const path = this.reconstructPath(closestNodeIdx, parentIndex, includeStart);
+         return { path, status: 'partial_path', iterations };
+    }
 
-    return { path: [], status: 'no_path', iterations };
+    return { path: [], status: iterations > maxIterations ? 'timeout' : 'no_path', iterations };
   }
 
   // --- Pool Management ---
@@ -511,7 +529,7 @@ export class PathfindingService {
           nodeState: new Uint32Array(size),
           closedSet: new Uint32Array(size),
           heap: new FlatMinHeap(initialHeapCap),
-          neighbors: new Int32Array(4)
+          neighbors: new Int32Array(MAX_NEIGHBORS)
       };
   }
 
@@ -550,7 +568,11 @@ export class PathfindingService {
     const path: Coordinates[] = [];
     let curr = endIdx;
     
-    while (curr !== -1) {
+    // Guard: Prevent infinite loops if parentIndex corrupted (should not happen)
+    let safety = 0;
+    const maxLen = this.totalTiles;
+
+    while (curr !== -1 && safety < maxLen) {
       const gx = curr % this.size;
       const gz = (curr / this.size) | 0;
       
@@ -560,19 +582,16 @@ export class PathfindingService {
       });
       
       curr = parentIndex[curr];
+      safety++;
     }
     
     path.reverse(); 
-    if (!includeStart) {
+    if (!includeStart && path.length > 0) {
         path.shift(); // Remove start node
     }
     return path;
   }
 
-  /**
-   * Optimized neighbor calculation.
-   * Avoids unnecessary division for Z coord by using array bounds and modulo.
-   */
   private fillNeighborsBuffer(idx: number, buffer: Int32Array): number {
     const x = idx % this.size;
     let count = 0;
