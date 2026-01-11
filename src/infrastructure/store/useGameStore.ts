@@ -10,69 +10,44 @@ import { v4 as uuidv4 } from 'uuid';
 import { TileData, TileType } from '../../entities/Map';
 import { GameEntity, Resources, GameEvent, Coordinates } from '../../shared/types';
 import { BuildingType, BUILD_COSTS } from '../../entities/Buildings';
-import { UnitType, UNIT_COSTS } from '../../entities/Units';
+import { UnitType, UNIT_COSTS, UNIT_STATS } from '../../entities/Units';
 import { calculateTurnIncome } from '../../core/systems/EconomySystem';
 import { pathfindingService } from '../../core/utils/pathfinding';
 
 interface GameState {
   // --- State ---
-  /** Массив всех тайлов карты */
   tiles: TileData[];
-  /** Массив всех активных сущностей (здания, юниты) */
   entities: GameEntity[];
-  /** Текущие ресурсы игрока */
   resources: Resources;
-  /** Номер текущего хода */
   turn: number;
-  /** Последнее активное событие */
   lastEvent: GameEvent | null;
-  /** Выбранный режим строительства */
+  
+  // Controls & Modes
   selectedBuildMode: BuildingType | null;
-  /** Выбранный режим найма */
   selectedUnitMode: UnitType | null;
-  /** Координаты тайла под курсором */
   hoveredTile: Coordinates | null;
+  selectedEntityId: string | null;
   
   // --- Actions ---
-  
-  /**
-   * Инициализирует новую игру, генерирует карту и синхронизирует навигацию.
-   * @param size Размер сетки (например, 50).
-   */
   initGame: (size: number) => void;
-  
-  /** Устанавливает тайл под курсором */
   setHoveredTile: (coords: Coordinates | null) => void;
-  /** Включает режим строительства */
   setBuildMode: (mode: BuildingType | null) => void;
-  /** Включает режим найма */
   setUnitMode: (mode: UnitType | null) => void;
-  /** Устанавливает активное событие */
   setLastEvent: (event: GameEvent | null) => void;
   
+  // --- RTS Interactions ---
+  selectEntity: (id: string | null) => void;
+  
+  /**
+   * Вызывается View-слоем, когда юнит визуально завершил перемещение на один тайл.
+   * Обновляет логическую позицию юнита в сетке.
+   */
+  completeMoveStep: (unitId: string) => void;
+  
   // --- Gameplay Actions ---
-  
-  /**
-   * Пытается построить здание в указанных координатах.
-   * Проверяет ресурсы, валидность тайла и обновляет навигационную сетку.
-   */
   buildEntity: (x: number, z: number) => void;
-  
-  /**
-   * Нанимает юнита в указанной точке.
-   */
   recruitUnit: (x: number, z: number) => void;
-  
-  /**
-   * Задает цель движения для юнита. Запускает асинхронный поиск пути.
-   * @async
-   */
   setUnitTarget: (unitId: string, x: number, z: number) => Promise<void>;
-  
-  /**
-   * Завершает ход. Перемещает юнитов, рассчитывает доход и применяет события.
-   * @param eventEffect Опциональная функция влияния события на ресурсы.
-   */
   nextTurn: (eventEffect?: (current: Resources) => Partial<Resources>) => void;
 }
 
@@ -83,9 +58,11 @@ export const useGameStore = create<GameState>((set, get) => ({
   resources: { wood: 100, stone: 50, gold: 50, population: 0, populationCap: 5 },
   turn: 1,
   lastEvent: null,
+  
   selectedBuildMode: null,
   selectedUnitMode: null,
   hoveredTile: null,
+  selectedEntityId: null,
 
   // Actions
   initGame: (size: number) => {
@@ -109,7 +86,6 @@ export const useGameStore = create<GameState>((set, get) => ({
       }
     }
     
-    // Initialize Navigation Grid
     pathfindingService.syncWithStore(initialTiles, size);
 
     set({
@@ -120,15 +96,42 @@ export const useGameStore = create<GameState>((set, get) => ({
         position: { x: 0, z: 0 },
         health: 500,
         maxHealth: 500,
-        faction: 'PLAYER'
+        faction: 'PLAYER',
+        state: 'IDLE'
       }]
     });
   },
 
   setHoveredTile: (coords) => set({ hoveredTile: coords }),
-  setBuildMode: (mode) => set({ selectedBuildMode: mode, selectedUnitMode: null }),
-  setUnitMode: (mode) => set({ selectedUnitMode: mode, selectedBuildMode: null }),
+  setBuildMode: (mode) => set({ selectedBuildMode: mode, selectedUnitMode: null, selectedEntityId: null }),
+  setUnitMode: (mode) => set({ selectedUnitMode: mode, selectedBuildMode: null, selectedEntityId: null }),
   setLastEvent: (event) => set({ lastEvent: event }),
+  
+  selectEntity: (id) => set({ 
+    selectedEntityId: id, 
+    selectedBuildMode: null, 
+    selectedUnitMode: null 
+  }),
+
+  completeMoveStep: (unitId) => {
+    set(state => ({
+      entities: state.entities.map(e => {
+        if (e.id !== unitId || !e.path || e.path.length === 0) return e;
+
+        // Unit arrived at path[0].
+        const nextPos = e.path[0];
+        const remainingPath = e.path.slice(1);
+        const newState = remainingPath.length === 0 ? 'IDLE' : 'MOVING';
+
+        return {
+          ...e,
+          position: nextPos,
+          path: remainingPath,
+          state: newState
+        };
+      })
+    }));
+  },
 
   buildEntity: (x, z) => {
     const { tiles, selectedBuildMode, resources } = get();
@@ -145,11 +148,10 @@ export const useGameStore = create<GameState>((set, get) => ({
          position: { x, z },
          health: 100,
          maxHealth: 100,
-         faction: 'PLAYER'
+         faction: 'PLAYER',
+         state: 'IDLE'
        };
 
-       // Optimistic Update & Navigation Update
-       // Roads = 0.5, Buildings = Obstacle
        const navType = selectedBuildMode === BuildingType.ROAD ? 'ROAD' : 'BUILDING';
        pathfindingService.updateNode(x, z, navType);
 
@@ -183,7 +185,9 @@ export const useGameStore = create<GameState>((set, get) => ({
           position: { x, z },
           health: selectedUnitMode === UnitType.HERO ? 200 : 50,
           maxHealth: selectedUnitMode === UnitType.HERO ? 200 : 50,
-          faction: 'PLAYER'
+          faction: 'PLAYER',
+          state: 'IDLE',
+          stats: UNIT_STATS[selectedUnitMode]
        };
 
        set(state => ({
@@ -200,9 +204,7 @@ export const useGameStore = create<GameState>((set, get) => ({
   },
 
   setUnitTarget: async (unitId: string, x: number, z: number) => {
-      // 1. Check Walkability (Fast Exit)
       if (!pathfindingService.isWalkable(x, z)) {
-          console.warn('Target is not walkable');
           return;
       }
 
@@ -210,25 +212,27 @@ export const useGameStore = create<GameState>((set, get) => ({
       const unit = entities.find(e => e.id === unitId);
       if (!unit) return;
 
-      // 2. Set Status to Calculating
       set(state => ({
           entities: state.entities.map(e => 
               e.id === unitId ? { ...e, isCalculatingPath: true } : e
           )
       }));
 
-      // 3. Async Pathfinding
       try {
           const result = await pathfindingService.findPath(unit.position, { x, z });
           
           if (result.status === 'success') {
             set(state => ({
                 entities: state.entities.map(e => 
-                    e.id === unitId ? { ...e, path: result.path, isCalculatingPath: false } : e
+                    e.id === unitId ? { 
+                        ...e, 
+                        path: result.path, 
+                        isCalculatingPath: false,
+                        state: 'MOVING' 
+                    } : e
                 )
             }));
           } else {
-            console.warn(`Pathfinding failed: ${result.status}`);
              set(state => ({
                 entities: state.entities.map(e => 
                     e.id === unitId ? { ...e, isCalculatingPath: false } : e
@@ -247,22 +251,10 @@ export const useGameStore = create<GameState>((set, get) => ({
 
   nextTurn: (eventEffect) => {
     set(state => {
-      // 1. Move Units along their paths
-      const movedEntities = state.entities.map(entity => {
-          if (entity.path && entity.path.length > 0) {
-              const nextStep = entity.path[0];
-              const remainingPath = entity.path.slice(1);
-              return {
-                  ...entity,
-                  position: nextStep,
-                  path: remainingPath
-              };
-          }
-          return entity;
-      });
-
-      // 2. Calculate Income
-      const income = calculateTurnIncome(movedEntities);
+      // Note: Movement is now Real-time, handled by completeMoveStep and View layer.
+      // nextTurn only handles Economy and Events (Seasons).
+      
+      const income = calculateTurnIncome(state.entities);
       let newResources = {
         ...state.resources,
         wood: state.resources.wood + (income.wood || 0),
@@ -272,15 +264,13 @@ export const useGameStore = create<GameState>((set, get) => ({
       if (eventEffect) {
         const effectChanges = eventEffect(newResources);
         newResources = { ...newResources, ...effectChanges };
-        // Ensure no negative resources
         newResources.wood = Math.max(0, newResources.wood);
         newResources.gold = Math.max(0, newResources.gold);
       }
 
       return {
         turn: state.turn + 1,
-        resources: newResources,
-        entities: movedEntities
+        resources: newResources
       };
     });
   }

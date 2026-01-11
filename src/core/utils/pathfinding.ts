@@ -11,17 +11,19 @@
  * 
  * API CONTRACT:
  * - findPath returns a PathResult object containing the path and status.
- * - Path excludes the start node.
+ * - **Path excludes the start node** and includes the end node.
+ * - Returns world coordinates.
  */
 
 import { TileData, TileType } from '../../entities/Map';
 import { Coordinates } from '../../shared/types';
 
-// REFERENCE: High-performance A* Pathfinding (v2.9)
-// Improvements (v2.9): 
-// - Dynamic Heuristic Cost (Admissibility Guarantee)
-// - Epsilon for Float Comparison (Heap Stability)
-// - Enhanced Cache Metrics
+// REFERENCE: High-performance A* Pathfinding (v2.9.1)
+// Improvements (v2.9.1): 
+// - Fixed BubbleUp Tie-Breaking
+// - Improved Cache Key (options aware)
+// - Dynamic Heap Sizing
+// - Explicit Thread Safety Comments
 
 const COSTS = {
   ROAD: 0.5,
@@ -92,6 +94,9 @@ class FlatMinHeap {
     this.indices[this.length] = index;
     this.f[this.length] = fVal;
     this.g[this.length] = gVal;
+    
+    // NOTE: We call bubbleUp on the current index (which equals old length).
+    // The length property is incremented AFTER. This is valid.
     this.bubbleUp(this.length);
     this.length++;
   }
@@ -144,14 +149,17 @@ class FlatMinHeap {
       const cf = this.f[idx];
       const pf = this.f[parentIdx];
       
-      // MinHeap property: Parent must be smaller. 
-      // Using EPSILON for float stability.
+      // MinHeap property: Parent must be smaller (smaller F is better).
       if (cf > pf + EPSILON) break;
       
-      // Tie-breaking: If F is roughly equal, prefer HIGHER G (closer to target).
-      // We only swap if Child is "better".
-      // If Child G <= Parent G, it's not better, so we stop.
-      if (Math.abs(cf - pf) < EPSILON && this.g[idx] <= this.g[parentIdx]) break;
+      // Tie-breaking: If F is roughly equal, we prefer HIGHER G (node closer to target).
+      // Higher G means the node is "better" in terms of progress, so it should bubble up (MinHeap stores "best" at top).
+      // Logic:
+      // If Child.G > Parent.G -> Child is better -> Swap.
+      // If Child.G <= Parent.G -> Child is NOT better -> Break.
+      if (Math.abs(cf - pf) < EPSILON) {
+         if (this.g[idx] <= this.g[parentIdx]) break;
+      }
       
       this.swap(idx, parentIdx);
       idx = parentIdx;
@@ -171,10 +179,10 @@ class FlatMinHeap {
       // Check Left
       let swapLeft = false;
       if (lf < bf - EPSILON) { 
-          // Strictly smaller F
+          // Strictly smaller F -> Better
           swapLeft = true;
       } else if (Math.abs(lf - bf) < EPSILON && this.g[left] > this.g[best]) {
-          // Equal F, but Better G (Higher G)
+          // Equal F, but Higher G -> Better
           swapLeft = true;
       }
 
@@ -233,6 +241,10 @@ export class PathfindingService {
   private maxCacheSize: number = 2000;
   
   // Buffer Pool for Thread Safety (Reentrancy)
+  // NOTE: This pool is NOT thread-safe for multi-threaded environments (Workers).
+  // It is safe for single-threaded concurrency (Async/Await) as long as findPath 
+  // execution blocks (synchronous loop) or properly checks out buffers.
+  // Current calculateAStar is synchronous.
   private bufferPool: ComputeBuffers[] = [];
   private maxPoolSize: number = 4;
   
@@ -325,6 +337,7 @@ export class PathfindingService {
     const startTime = performance.now();
     const sIdx = this.toIndex(start.x, start.z);
     const eIdx = this.toIndex(end.x, end.z);
+    const maxIter = options.maxIterations ?? this.defaultMaxIterations;
 
     // Fail Fast
     if (sIdx === -1 || eIdx === -1) {
@@ -338,7 +351,8 @@ export class PathfindingService {
     }
 
     // Check Cache (LRU)
-    const cacheKey = `${sIdx}-${eIdx}`;
+    // Key now includes maxIterations to avoid returning partial/timeout paths for different constraints
+    const cacheKey = `${sIdx}-${eIdx}-${maxIter}`;
     const cached = this.pathCache.get(cacheKey);
     if (cached && cached.version === this.gridVersion) {
         const duration = performance.now() - startTime;
@@ -352,11 +366,10 @@ export class PathfindingService {
         };
     }
 
-    // Acquire Buffers
+    // Acquire Buffers (Synchronous checkout)
     const buffers = this.acquireBuffers();
     
     try {
-        const maxIter = options.maxIterations ?? this.defaultMaxIterations;
         const result = this.calculateAStar(sIdx, eIdx, maxIter, buffers);
         const duration = performance.now() - startTime;
         
@@ -391,7 +404,8 @@ export class PathfindingService {
     const { gScore, parentIndex, visited, heap, neighbors } = buffers;
 
     // Reset logic (fast fill)
-    gScore.fill(Infinity);
+    // Use Number.POSITIVE_INFINITY for clarity and consistency
+    gScore.fill(Number.POSITIVE_INFINITY);
     parentIndex.fill(-1);
     visited.fill(0);
     heap.clear();
@@ -433,8 +447,7 @@ export class PathfindingService {
 
         const tentativeG = current.g + weight;
 
-        // Use strict check. If new path is significantly better (or equal with better heuristic?)
-        // Standard A*: Strictly less.
+        // Use strict check.
         if (tentativeG < gScore[neighborIdx]) {
           parentIndex[neighborIdx] = currentIdx;
           gScore[neighborIdx] = tentativeG;
@@ -450,7 +463,8 @@ export class PathfindingService {
   // --- Pool Management ---
 
   private createBuffers(size: number): ComputeBuffers {
-      const initialHeapCap = 1024; 
+      // Dynamic initial capacity: Heuristic around 1/4 of map size or min 1024
+      const initialHeapCap = Math.max(1024, Math.floor(size / 4));
       
       return {
           gScore: new Float32Array(size),

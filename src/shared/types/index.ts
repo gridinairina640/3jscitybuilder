@@ -30,6 +30,16 @@ export interface Resources {
   populationCap: number;
 }
 
+/** Характеристики боевого юнита */
+export interface UnitStats {
+  speed: number;   // Тайлов в секунду
+  attack: number;
+  defense: number;
+  range: number;
+}
+
+export type EntityState = 'IDLE' | 'MOVING' | 'ATTACKING' | 'WORKING';
+
 /**
  * Основная игровая сущность (Здание или Юнит).
  * Существует в игровом мире и рендерится в 3D.
@@ -41,6 +51,10 @@ export interface GameEntity {
   health: number;
   maxHealth: number;
   faction: 'PLAYER' | 'ENEMY';
+  
+  // --- RTS Mechanics ---
+  state: EntityState;
+  stats?: UnitStats; // Только для юнитов
   
   // --- Свойства для поиска пути (только для юнитов) ---
   
@@ -61,41 +75,30 @@ export interface GameEvent {
 }
 
 // Augment JSX namespace for React Three Fiber elements to prevent type errors.
-// This handles cases where R3F types are not automatically picked up.
-// We augment both global JSX and React.JSX to cover different TS/React configurations.
-
 type R3FElement = any;
 
 declare global {
   namespace JSX {
     interface IntrinsicElements {
-      // Core
       group: R3FElement;
       mesh: R3FElement;
       instancedMesh: R3FElement;
       primitive: R3FElement;
-      
-      // Geometry
       boxGeometry: R3FElement;
       planeGeometry: R3FElement;
       sphereGeometry: R3FElement;
       coneGeometry: R3FElement;
       cylinderGeometry: R3FElement;
       ringGeometry: R3FElement;
-      
-      // Materials
+      torusGeometry: R3FElement;
       meshStandardMaterial: R3FElement;
       meshBasicMaterial: R3FElement;
       meshPhongMaterial: R3FElement;
-      
-      // Lights & Others
       ambientLight: R3FElement;
       directionalLight: R3FElement;
       pointLight: R3FElement;
       spotLight: R3FElement;
       color: R3FElement;
-
-      // Fallback index signature to catch any other R3F elements
       [elemName: string]: any;
     }
   }
@@ -104,33 +107,25 @@ declare global {
 declare module 'react' {
   namespace JSX {
     interface IntrinsicElements {
-      // Core
       group: R3FElement;
       mesh: R3FElement;
       instancedMesh: R3FElement;
       primitive: R3FElement;
-      
-      // Geometry
       boxGeometry: R3FElement;
       planeGeometry: R3FElement;
       sphereGeometry: R3FElement;
       coneGeometry: R3FElement;
       cylinderGeometry: R3FElement;
       ringGeometry: R3FElement;
-      
-      // Materials
+      torusGeometry: R3FElement;
       meshStandardMaterial: R3FElement;
       meshBasicMaterial: R3FElement;
       meshPhongMaterial: R3FElement;
-      
-      // Lights & Others
       ambientLight: R3FElement;
       directionalLight: R3FElement;
       pointLight: R3FElement;
       spotLight: R3FElement;
       color: R3FElement;
-
-      // Fallback index signature to catch any other R3F elements
       [elemName: string]: any;
     }
   }
