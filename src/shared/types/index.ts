@@ -38,7 +38,7 @@ export interface UnitStats {
   range: number;
 }
 
-export type EntityState = 'IDLE' | 'MOVING' | 'ATTACKING' | 'WORKING';
+export type EntityState = 'IDLE' | 'MOVING' | 'ATTACKING' | 'WORKING' | 'RETURNING';
 
 /**
  * Основная игровая сущность (Здание или Юнит).
@@ -56,9 +56,19 @@ export interface GameEntity {
   state: EntityState;
   stats?: UnitStats; // Только для юнитов
   
+  // --- Walker / Economy Mechanics (Workers) ---
+  homeId?: string;           // ID здания, к которому приписан юнит
+  currentRange?: number;     // Оставшийся запас хода
+  maxRange?: number;         // Максимальный радиус действия
+  visitedTiles?: Coordinates[]; // История последних посещенных клеток (Random Walk memory)
+  
+  // --- Patrol Mechanics (Buildings & Units) ---
+  patrolPath?: Coordinates[]; // Маршрут патрулирования (для зданий) или активный путь (для юнитов)
+  patrolIndex?: number;       // Индекс текущей целевой точки в patrolPath
+  
   // --- Свойства для поиска пути (только для юнитов) ---
   
-  /** Текущий рассчитанный путь движения */
+  /** Текущий рассчитанный путь движения (A*) */
   path?: Coordinates[];
   /** Флаг, указывающий, что идет асинхронный расчет пути */
   isCalculatingPath?: boolean;
