@@ -32,7 +32,7 @@ export const GameMap: React.FC = () => {
   // Process pathfinding queue every frame with a 2ms budget.
   // This keeps the UI responsive even with many units requesting paths.
   useFrame(() => {
-    pathfindingScheduler.tick(2);
+    pathfindingScheduler.processQueue(2);
   });
 
   const handleTileClick = (x: number, z: number) => {

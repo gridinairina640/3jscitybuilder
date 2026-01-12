@@ -243,11 +243,11 @@ export const useGameStore = create<GameState>((set, get) => ({
 
                    try {
                        // Use Scheduler with MEDIUM priority for background workers
-                       const result = await pathfindingScheduler.schedule(
+                       const result = await pathfindingScheduler.requestPath(
                            homeBuilding.position,
                            targetBuilding.position,
-                           { failToClosest: true },
-                           Priority.MEDIUM
+                           Priority.MEDIUM,
+                           { failToClosest: true }
                        );
 
                        if (result.status === 'success' || result.status === 'partial_path') {
@@ -289,11 +289,11 @@ export const useGameStore = create<GameState>((set, get) => ({
 
       try {
           // Use Scheduler with HIGH priority for direct user commands
-          const result = await pathfindingScheduler.schedule(
+          const result = await pathfindingScheduler.requestPath(
               unit.position, 
               { x, z }, 
-              { failToClosest: true },
-              Priority.HIGH
+              Priority.HIGH,
+              { failToClosest: true }
           );
           
           if (result.status === 'success' || result.status === 'partial_path') {

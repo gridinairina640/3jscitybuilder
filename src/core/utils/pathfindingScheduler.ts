@@ -45,11 +45,11 @@ class PathfindingScheduler {
    * Если путь есть в кэше, возвращает его мгновенно.
    * Иначе ставит запрос в очередь.
    */
-  public schedule(
+  public requestPath(
     start: Coordinates, 
     end: Coordinates, 
-    options: PathOptions = {},
-    priority: Priority = Priority.MEDIUM
+    priority: Priority = Priority.MEDIUM,
+    options: PathOptions = {}
   ): Promise<PathResult> {
     
     // 1. Synchronous Cache Check (Bypass Queue)
@@ -59,9 +59,6 @@ class PathfindingScheduler {
       return Promise.resolve(cached);
     }
     
-    // Note: Static paths usually checked by Store before calling schedule,
-    // but we can add logic here if needed. For now, rely on LRU hit or Store static check.
-
     // 2. Enqueue Request
     return new Promise((resolve, reject) => {
       const request: PathRequest = {
@@ -89,7 +86,7 @@ class PathfindingScheduler {
    * Должен вызываться в игровом цикле (например, useFrame).
    * @param budgetMs Максимальное время работы в миллисекундах (default: 2ms)
    */
-  public tick(budgetMs: number = 2): void {
+  public processQueue(budgetMs: number = 2): void {
     const startTime = performance.now();
     let processed = 0;
 
@@ -110,13 +107,7 @@ class PathfindingScheduler {
         if (!request) break;
 
         // Execute A*
-        // We use the raw async findPath but await it immediately in this async-like context
-        // Actually, since findPath is heavy sync code (despite being async marked in previous steps for future),
-        // we treat it as a blocking op that consumes budget.
-        
-        // IMPORTANT: In the refactored PathfindingService, findPath is logically synchronous CPU work wrapped in Promise
-        // or just plain synchronous work. To respect time-slicing, we invoke it and measure time.
-        
+        // We catch errors to prevent the scheduler from crashing
         try {
             this.service.findPath(request.start, request.end, request.options)
                 .then(result => request.resolve(result))
@@ -131,7 +122,6 @@ class PathfindingScheduler {
     
     if (processed > 0) {
         this.processedCount += processed;
-        // Optional: log metrics periodically
     }
   }
 }

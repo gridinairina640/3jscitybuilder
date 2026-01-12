@@ -22,6 +22,7 @@ import { Coordinates } from '../../shared/types';
 // - Added Static Path Caching (Nebuchadnezzar Style).
 // - Added methods getStaticPath / saveStaticPath for persistent routes between entities.
 // - Static paths use lazy invalidation via gridVersion check.
+// - Added checkCache for Time-Slicing Scheduler integration.
 
 const COSTS = {
   ROAD: 0.5,
@@ -295,6 +296,7 @@ export class PathfindingService {
 
   /**
    * Публичный метод для проверки кэша (используется планировщиком).
+   * Позволяет избежать постановки в очередь, если путь уже известен.
    */
   public checkCache(start: Coordinates, end: Coordinates, options: PathOptions = {}): PathResult | null {
       const sIdx = this.toIndex(start.x, start.z);
