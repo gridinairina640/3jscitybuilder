@@ -97,25 +97,25 @@ class PathfindingScheduler {
       const queue = this.queues.get(priority)!;
 
       while (queue.length > 0) {
-        // Check budget
-        if (performance.now() - startTime > budgetMs) {
-           return; 
-        }
-
         // Dequeue (FIFO)
         const request = queue.shift();
         if (!request) break;
 
-        // Execute A*
-        // We catch errors to prevent the scheduler from crashing
         try {
-            this.service.findPath(request.start, request.end, request.options)
-                .then(result => request.resolve(result))
-                .catch(err => request.reject(err));
-            
+            // Execute synchronous pathfinding
+            // Note: This operation blocks the main thread.
+            const result = this.service.findPathSync(request.start, request.end, request.options);
+            request.resolve(result);
             processed++;
         } catch (e) {
             request.reject(e);
+        }
+
+        // Check budget AFTER execution.
+        // If the last search took long, we stop here to allow the frame to render.
+        // This prevents multiple heavy searches from freezing the frame completely.
+        if (performance.now() - startTime > budgetMs) {
+           return; 
         }
       }
     }

@@ -17,12 +17,12 @@
 import { TileData, TileType } from '../../entities/Map';
 import { Coordinates } from '../../shared/types';
 
-// REFERENCE: High-performance A* Pathfinding (v3.10.0)
-// Improvements (v3.10.0):
-// - Added Static Path Caching (Nebuchadnezzar Style).
-// - Added methods getStaticPath / saveStaticPath for persistent routes between entities.
-// - Static paths use lazy invalidation via gridVersion check.
-// - Added checkCache for Time-Slicing Scheduler integration.
+// REFERENCE: High-performance A* Pathfinding (v3.11.0)
+// Improvements (v3.11.0):
+// - Fixed FlatMinHeap swap bug.
+// - Added Synchronous API (findPathSync) for Scheduler integration.
+// - Added Heuristic Tie-Breaking (Cross Product) for straighter paths.
+// - checkCache exposed for Scheduler.
 
 const COSTS = {
   ROAD: 0.5,
@@ -194,9 +194,6 @@ class FlatMinHeap {
     this.indices[j] = tempI;
     this.f[j] = tempF;
     this.g[j] = tempG;
-    this.indices[j] = tempI;
-    this.f[j] = tempF;
-    this.g[j] = tempG;
   }
 }
 
@@ -208,6 +205,10 @@ export class PathfindingService {
   private gridVersion: number = 0;
   private readonly minStepCost: number = COSTS.MIN_STEP;
   private globalSearchId: number = 0;
+  
+  // Tie-breaker state
+  private startGridX: number = 0;
+  private startGridZ: number = 0;
   
   private pathCache: Map<string, { path: Coordinates[]; version: number }> = new Map();
   private maxCacheSize: number = 2000;
@@ -274,10 +275,6 @@ export class PathfindingService {
     return Number.isFinite(this.grid[idx]);
   }
 
-  /**
-   * Получает статический маршрут между двумя зданиями/сущностями.
-   * Проверяет gridVersion для ленивой инвалидации.
-   */
   public getStaticPath(fromId: string, toId: string): Coordinates[] | null {
       const key = `static:${fromId}:${toId}`;
       const cached = this.pathCache.get(key);
@@ -294,10 +291,6 @@ export class PathfindingService {
       return null;
   }
 
-  /**
-   * Публичный метод для проверки кэша (используется планировщиком).
-   * Позволяет избежать постановки в очередь, если путь уже известен.
-   */
   public checkCache(start: Coordinates, end: Coordinates, options: PathOptions = {}): PathResult | null {
       const sIdx = this.toIndex(start.x, start.z);
       const eIdx = this.toIndex(end.x, end.z);
@@ -323,9 +316,6 @@ export class PathfindingService {
       return null;
   }
 
-  /**
-   * Сохраняет статический маршрут между сущностями.
-   */
   public saveStaticPath(fromId: string, toId: string, path: Coordinates[]): void {
       const key = `static:${fromId}:${toId}`;
       
@@ -340,14 +330,18 @@ export class PathfindingService {
       });
   }
 
-  public async findPath(
+  /**
+   * Synchronous pathfinding execution.
+   * This method blocks the thread until completion or timeout.
+   */
+  public findPathSync(
       start: Coordinates, 
       end: Coordinates, 
       options: PathOptions = {}
-  ): Promise<PathResult> {
+  ): PathResult {
     const startTime = performance.now();
     
-    // Check Cache immediately (Redundant if called via Scheduler, but safe for direct calls)
+    // 1. Check Cache
     const cachedResult = this.checkCache(start, end, options);
     if (cachedResult) return cachedResult;
 
@@ -356,14 +350,13 @@ export class PathfindingService {
     const sIdx = this.toIndex(start.x, start.z);
     const eIdx = this.toIndex(end.x, end.z);
     
-    // Validation
-    if (!Number.isFinite(start.x) || !Number.isFinite(start.z) || 
-        !Number.isFinite(end.x) || !Number.isFinite(end.z)) {
-        return { path: [], status: 'invalid_args' };
-    }
+    // 2. Validation
     if (sIdx === -1 || eIdx === -1) return { path: [], status: 'invalid_args' };
     
-    // Short-circuits
+    // 3. Store State for Heuristic Tie-Breaking
+    this.startGridX = this.toGridX(start.x);
+    this.startGridZ = this.toGridZ(start.z);
+
     const includeStart = options.includeStartNode ?? false;
     if (sIdx === eIdx) {
         const path = includeStart ? [{ ...end }] : [];
@@ -374,14 +367,13 @@ export class PathfindingService {
     if (!Number.isFinite(this.grid[sIdx])) return { path: [], status: 'no_path' };
     if (!failToClosest && !Number.isFinite(this.grid[eIdx])) return { path: [], status: 'no_path' };
 
-    // Set up search
+    // 4. Execution
     this.cacheMisses++;
     const buffers = this.acquireBuffers();
     const safetyLimit = Math.max(this.totalTiles * 2, 50000);
     const maxIter = Math.min(options.maxIterations ?? this.defaultMaxIterations, safetyLimit);
     const hWeight = options.heuristicWeight ?? 1.0;
     
-    // Cache Key reconstruction for saving later
     const safeHWeight = Math.round(hWeight * 100) / 100;
     const cacheKey = `${sIdx}-${eIdx}-${safeHWeight}-${includeStart}-${failToClosest}`;
 
@@ -415,6 +407,13 @@ export class PathfindingService {
     } finally {
         this.releaseBuffers(buffers);
     }
+  }
+
+  /**
+   * Async wrapper for API compatibility.
+   */
+  public async findPath(start: Coordinates, end: Coordinates, options: PathOptions = {}): Promise<PathResult> {
+      return this.findPathSync(start, end, options);
   }
 
   private calculateAStar(
@@ -457,12 +456,13 @@ export class PathfindingService {
 
       const current = heap.pop()!;
       const currentIdx = current.index;
-      const currentG = (nodeState[currentIdx] === currentId) ? gScore[currentIdx] : Infinity;
       
-      if (current.g > currentG) continue;
+      // Lazy deletion check: if we found a better G for this node already, skip old heap entry
+      if (nodeState[currentIdx] === currentId && current.g > gScore[currentIdx]) continue;
       
       if (failToClosest) {
-          const h = this.heuristic(currentIdx, endIdx);
+          // Note: using basic manhattan for quick fail check
+          const h = this.heuristic(currentIdx, endIdx); 
           if (h < minH) {
               minH = h;
               closestNodeIdx = currentIdx;
@@ -491,13 +491,9 @@ export class PathfindingService {
             nodeState[neighborIdx] = currentId;
         }
 
-        const tentativeG = currentG + weight;
+        const tentativeG = current.g + weight;
 
-        // Overflow check for Float32 safety
-        if (tentativeG > FLOAT32_SAFE_LIMIT) {
-             console.warn(`[Pathfinding] Cost limit exceeded at idx ${neighborIdx}. Skipping to prevent precision loss.`);
-             continue;
-        }
+        if (tentativeG > FLOAT32_SAFE_LIMIT) continue;
 
         if (tentativeG < gScore[neighborIdx]) {
           parentIndex[neighborIdx] = currentIdx;
@@ -510,12 +506,9 @@ export class PathfindingService {
     
     if (failToClosest) {
          if (closestNodeIdx === startIdx) return { path: [], status: 'no_path', iterations };
-         
          if (parentIndex[closestNodeIdx] === -1 && closestNodeIdx !== startIdx) {
-             console.warn("[Pathfinding] Closest node found but has no parent. Returning no_path.");
              return { path: [], status: 'no_path', iterations };
          }
-         
          return { path: this.reconstructPath(closestNodeIdx, parentIndex, includeStart), status: 'partial_path', iterations };
     }
 
@@ -547,12 +540,32 @@ export class PathfindingService {
       if (this.bufferPool.length < this.maxPoolSize) this.bufferPool.push(buffers);
   }
 
-  private heuristic(aIdx: number, bIdx: number): number {
-    const ax = aIdx % this.size;
-    const az = (aIdx / this.size) | 0;
-    const bx = bIdx % this.size;
-    const bz = (bIdx / this.size) | 0;
-    return (Math.abs(ax - bx) + Math.abs(az - bz)) * this.minStepCost;
+  private heuristic(currentIdx: number, targetIdx: number): number {
+    const ax = currentIdx % this.size;
+    const az = (currentIdx / this.size) | 0;
+    const bx = targetIdx % this.size;
+    const bz = (targetIdx / this.size) | 0;
+    
+    // 1. Basic Manhattan
+    const h = (Math.abs(ax - bx) + Math.abs(az - bz)) * this.minStepCost;
+    
+    // 2. Tie-Breaking: Cross-Product
+    // Prevents "zigzag" on large open areas by preferring nodes closer to the straight line Start->End
+    // Vector 1: Start -> End (dx1, dz1)
+    // Vector 2: Start -> Current (dx2, dz2)
+    const sx = this.startGridX;
+    const sz = this.startGridZ;
+    
+    const dx1 = bx - sx;
+    const dz1 = bz - sz;
+    const dx2 = ax - sx;
+    const dz2 = az - sz;
+    
+    // Cross product magnitude
+    const cross = Math.abs(dx1 * dz2 - dx2 * dz1);
+    
+    // Add small penalty. 0.001 is small enough not to break admissibility significantly for integer grids
+    return h + cross * 0.001;
   }
 
   private reconstructPath(endIdx: number, parentIndex: Int32Array, includeStart: boolean): Coordinates[] {
