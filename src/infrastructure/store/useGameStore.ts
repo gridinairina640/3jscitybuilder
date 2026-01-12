@@ -21,7 +21,8 @@ interface GameState {
   tiles: TileData[];
   entities: GameEntity[];
   resources: Resources;
-  turn: number;
+  turn: number; // In real-time context, this represents "Months"
+  isPlaying: boolean;
   lastEvent: GameEvent | null;
   
   // Controls & Modes
@@ -32,6 +33,7 @@ interface GameState {
   
   // --- Actions ---
   initGame: (size: number) => void;
+  togglePause: () => void;
   setHoveredTile: (coords: Coordinates | null) => void;
   setBuildMode: (mode: BuildingType | null) => void;
   setUnitMode: (mode: UnitType | null) => void;
@@ -39,18 +41,16 @@ interface GameState {
   
   // --- RTS Interactions ---
   selectEntity: (id: string | null) => void;
-  
-  /**
-   * Вызывается View-слоем, когда юнит визуально завершил перемещение на один тайл.
-   * Обновляет логическую позицию юнита в сетке и запускает AI следующего шага.
-   */
   completeMoveStep: (unitId: string) => Promise<void>;
   
   // --- Gameplay Actions ---
   buildEntity: (x: number, z: number) => void;
   recruitUnit: (x: number, z: number) => Promise<void>;
   setUnitTarget: (unitId: string, x: number, z: number) => Promise<void>;
-  nextTurn: (eventEffect?: (current: Resources) => Partial<Resources>) => void;
+  
+  // --- Real-time Logic ---
+  tick: () => void; // Calculates passive income and advances time
+  applyEventResult: (effect: (current: Resources) => Partial<Resources>) => void;
 }
 
 export const useGameStore = create<GameState>((set, get) => ({
@@ -59,6 +59,7 @@ export const useGameStore = create<GameState>((set, get) => ({
   entities: [],
   resources: { wood: 100, stone: 50, gold: 50, population: 0, populationCap: 5 },
   turn: 1,
+  isPlaying: true, // Auto-start
   lastEvent: null,
   
   selectedBuildMode: null,
@@ -104,6 +105,7 @@ export const useGameStore = create<GameState>((set, get) => ({
     });
   },
 
+  togglePause: () => set(state => ({ isPlaying: !state.isPlaying })),
   setHoveredTile: (coords) => set({ hoveredTile: coords }),
   setBuildMode: (mode) => set({ selectedBuildMode: mode, selectedUnitMode: null, selectedEntityId: null }),
   setUnitMode: (mode) => set({ selectedUnitMode: mode, selectedBuildMode: null, selectedEntityId: null }),
@@ -175,14 +177,12 @@ export const useGameStore = create<GameState>((set, get) => ({
         } else if (parentBuilding?.patrolPath && decision.patrolIndex !== undefined) {
             target = parentBuilding.patrolPath[decision.patrolIndex];
         } else if (decision.state === 'MOVING' && unit.type === UnitType.WORKER && parentBuilding?.type === BuildingType.LUMBER_MILL) {
-             // Lumberjack looking for forest
              const nearestForest = findNearestTileType(unit.position, TileType.FOREST, state.tiles);
              if (nearestForest) target = nearestForest;
         }
 
         if (target) {
             try {
-                // We use LOW priority for ambient walkers to not clog the queue
                 const result = await pathfindingScheduler.requestPath(
                     unit.position,
                     target,
@@ -200,7 +200,6 @@ export const useGameStore = create<GameState>((set, get) => ({
                         } : e)
                     }));
                 } else {
-                     // Path failed, go IDLE
                      set(s => ({
                         entities: s.entities.map(e => e.id === unitId ? { ...e, state: 'IDLE', isCalculatingPath: false } : e)
                     }));
@@ -261,17 +260,13 @@ export const useGameStore = create<GameState>((set, get) => ({
 
     const cost = UNIT_COSTS[selectedUnitMode];
     if (resources.gold >= (cost.gold || 0) && resources.wood >= (cost.wood || 0) && resources.population < resources.populationCap) {
-       
        const unitId = uuidv4();
-
-       // 1. Identify Home (Building at spawn location)
        const homeBuilding = entities.find(e => 
             Math.round(e.position.x) === x && 
             Math.round(e.position.z) === z &&
             Object.values(BuildingType).includes(e.type as BuildingType)
        );
 
-       // 2. Initial Setup
        const newEntity: GameEntity = {
           id: unitId,
           type: selectedUnitMode,
@@ -282,13 +277,11 @@ export const useGameStore = create<GameState>((set, get) => ({
           state: 'IDLE',
           stats: UNIT_STATS[selectedUnitMode],
           homeId: homeBuilding?.id,
-          // Walker Stats
           maxRange: 50,
           currentRange: 50,
           visitedTiles: []
        };
 
-       // 3. Commit Spawn (Synchronous part)
        set(state => ({
           resources: {
             ...state.resources,
@@ -300,7 +293,6 @@ export const useGameStore = create<GameState>((set, get) => ({
           selectedUnitMode: null
        }));
        
-       // Trigger initial logic
        setTimeout(() => get().completeMoveStep(unitId), 100);
     }
   },
@@ -317,7 +309,6 @@ export const useGameStore = create<GameState>((set, get) => ({
       }));
 
       try {
-          // Use Scheduler with HIGH priority for direct user commands
           const result = await pathfindingScheduler.requestPath(
               unit.position, 
               { x, z }, 
@@ -333,7 +324,6 @@ export const useGameStore = create<GameState>((set, get) => ({
                         path: result.path, 
                         isCalculatingPath: false,
                         state: 'MOVING',
-                        // Reset walker state on manual command
                         currentRange: 50,
                         visitedTiles: []
                     } : e
@@ -356,26 +346,36 @@ export const useGameStore = create<GameState>((set, get) => ({
       }
   },
 
-  nextTurn: (eventEffect) => {
+  // --- REAL-TIME ACTIONS ---
+
+  tick: () => {
     set(state => {
+      if (!state.isPlaying) return state;
+
+      // Passive Income (e.g. Taxes)
       const income = calculateTurnIncome(state.entities);
-      let newResources = {
-        ...state.resources,
-        wood: state.resources.wood + (income.wood || 0),
-        gold: state.resources.gold + (income.gold || 0)
-      };
-
-      if (eventEffect) {
-        const effectChanges = eventEffect(newResources);
-        newResources = { ...newResources, ...effectChanges };
-        newResources.wood = Math.max(0, newResources.wood);
-        newResources.gold = Math.max(0, newResources.gold);
-      }
-
+      
       return {
         turn: state.turn + 1,
-        resources: newResources
+        resources: {
+          ...state.resources,
+          wood: state.resources.wood + (income.wood || 0),
+          gold: state.resources.gold + (income.gold || 0)
+        }
       };
     });
+  },
+
+  applyEventResult: (effect) => {
+      set(state => {
+          const changes = effect(state.resources);
+          const newResources = { ...state.resources, ...changes };
+          // Clamp negative resources
+          newResources.wood = Math.max(0, newResources.wood);
+          newResources.gold = Math.max(0, newResources.gold);
+          newResources.stone = Math.max(0, newResources.stone);
+          
+          return { resources: newResources };
+      });
   }
 }));

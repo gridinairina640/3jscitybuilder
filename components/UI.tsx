@@ -9,7 +9,7 @@ import React from 'react';
 import { Resources, GameEvent } from '../src/shared/types';
 import { BuildingType, BUILD_COSTS } from '../src/entities/Buildings';
 import { UnitType, UNIT_COSTS } from '../src/entities/Units';
-import { Sword, Hammer, Trees, Gem, Users, HardHat, Shield, Zap, X } from 'lucide-react';
+import { Sword, Hammer, Trees, Gem, Users, HardHat, Play, Pause, X } from 'lucide-react';
 
 interface UIProps {
   resources: Resources;
@@ -18,10 +18,10 @@ interface UIProps {
   selectedUnitMode: UnitType | null;
   setUnitMode: (type: UnitType | null) => void;
   turn: number;
-  onNextTurn: () => void;
+  isPlaying: boolean;
+  onTogglePause: () => void;
   lastEvent: GameEvent | null;
   onCloseEvent: () => void;
-  isLoading: boolean;
 }
 
 export const UI: React.FC<UIProps> = ({
@@ -31,10 +31,10 @@ export const UI: React.FC<UIProps> = ({
   selectedUnitMode,
   setUnitMode,
   turn,
-  onNextTurn,
+  isPlaying,
+  onTogglePause,
   lastEvent,
-  onCloseEvent,
-  isLoading
+  onCloseEvent
 }) => {
   return (
     <div className="absolute inset-0 pointer-events-none flex flex-col justify-between p-4 z-10">
@@ -43,15 +43,15 @@ export const UI: React.FC<UIProps> = ({
         <div className="bg-slate-900/90 backdrop-blur-md p-3 rounded-xl border border-slate-700 text-slate-100 flex gap-6 shadow-xl pointer-events-auto">
           <div className="flex items-center gap-2">
             <Trees className="w-5 h-5 text-emerald-400" />
-            <span className="font-bold">{resources.wood}</span>
+            <span className="font-bold">{Math.floor(resources.wood)}</span>
           </div>
           <div className="flex items-center gap-2">
             <HardHat className="w-5 h-5 text-stone-400" />
-            <span className="font-bold">{resources.stone}</span>
+            <span className="font-bold">{Math.floor(resources.stone)}</span>
           </div>
           <div className="flex items-center gap-2">
             <Gem className="w-5 h-5 text-yellow-400" />
-            <span className="font-bold">{resources.gold}</span>
+            <span className="font-bold">{Math.floor(resources.gold)}</span>
           </div>
           <div className="flex items-center gap-2 border-l border-slate-600 pl-4">
             <Users className="w-5 h-5 text-blue-400" />
@@ -59,18 +59,34 @@ export const UI: React.FC<UIProps> = ({
           </div>
         </div>
 
-        <div className="bg-slate-900/90 backdrop-blur-md p-3 rounded-xl border border-slate-700 text-slate-100 pointer-events-auto">
-             <div className="text-sm text-slate-400 uppercase tracking-wider font-semibold">Year {Math.floor(turn / 12) + 1} - Month {turn % 12 + 1}</div>
-             <button 
-                onClick={onNextTurn}
-                disabled={isLoading}
-                className={`mt-2 w-full flex items-center justify-center gap-2 py-2 px-4 rounded-lg font-bold transition-all ${
-                    isLoading ? 'bg-slate-700 text-slate-500' : 'bg-indigo-600 hover:bg-indigo-500 text-white'
-                }`}
-             >
-                {isLoading ? 'Thinking...' : 'End Turn'}
-                <Zap className="w-4 h-4" />
-             </button>
+        <div className="flex gap-4">
+            {/* Time Control */}
+            <div className="bg-slate-900/90 backdrop-blur-md p-3 rounded-xl border border-slate-700 text-slate-100 pointer-events-auto flex flex-col items-center min-w-[140px]">
+                 <div className="text-sm text-slate-400 uppercase tracking-wider font-semibold mb-2">
+                    Year {Math.floor(turn / 12) + 1} - Month {turn % 12 + 1}
+                 </div>
+                 
+                 <button 
+                    onClick={onTogglePause}
+                    className={`w-full flex items-center justify-center gap-2 py-1.5 px-4 rounded-lg font-bold transition-all text-sm border ${
+                        isPlaying 
+                            ? 'bg-amber-600/20 border-amber-500 text-amber-500 hover:bg-amber-600/30' 
+                            : 'bg-emerald-600/20 border-emerald-500 text-emerald-500 hover:bg-emerald-600/30'
+                    }`}
+                 >
+                    {isPlaying ? (
+                        <>
+                            <Pause className="w-4 h-4 fill-current" />
+                            <span>Pause</span>
+                        </>
+                    ) : (
+                        <>
+                            <Play className="w-4 h-4 fill-current" />
+                            <span>Resume</span>
+                        </>
+                    )}
+                 </button>
+            </div>
         </div>
       </div>
 

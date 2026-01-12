@@ -5,23 +5,25 @@
  * Инициализирует Canvas (R3F), освещение и управляет глобальным игровым циклом (ходы, события).
  */
 
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef } from 'react';
 import { Canvas } from '@react-three/fiber';
 import { OrbitControls, Stars } from '@react-three/drei';
 
 import { GameMap } from './src/components/GameMap';
 import { UI } from './components/UI';
-import { generateGameEvent } from './services/geminiService';
 import { useGameStore } from './src/infrastructure/store/useGameStore';
-import { Resources } from './src/shared/types';
 
 // Initial Grid Size
 const GRID_SIZE = 50;
+
+// Game Loop Configuration
+const TICK_RATE_MS = 5000; // 5 seconds = 1 Month (Global Tick)
 
 function App() {
   const initGame = useGameStore(state => state.initGame);
   const resources = useGameStore(state => state.resources);
   const turn = useGameStore(state => state.turn);
+  const isPlaying = useGameStore(state => state.isPlaying);
   const lastEvent = useGameStore(state => state.lastEvent);
   const selectedBuildMode = useGameStore(state => state.selectedBuildMode);
   const selectedUnitMode = useGameStore(state => state.selectedUnitMode);
@@ -30,37 +32,31 @@ function App() {
   const setBuildMode = useGameStore(state => state.setBuildMode);
   const setUnitMode = useGameStore(state => state.setUnitMode);
   const setLastEvent = useGameStore(state => state.setLastEvent);
-  const nextTurn = useGameStore(state => state.nextTurn);
+  const togglePause = useGameStore(state => state.togglePause);
+  
+  const tick = useGameStore(state => state.tick);
 
-  const [aiLoading, setAiLoading] = useState(false);
+  const turnRef = useRef(turn); // Ref to access current turn inside closure
+
+  // Sync ref
+  useEffect(() => { turnRef.current = turn; }, [turn]);
 
   // --- Initialization ---
   useEffect(() => {
     initGame(GRID_SIZE);
   }, [initGame]);
 
-  // --- Turn Logic & AI ---
-  const handleNextTurn = async () => {
-    setAiLoading(true);
-    
-    // 1. Generate Event (Async)
-    const event = await generateGameEvent(resources, turn, "Temperate Forest");
-    setLastEvent(event);
-    
-    // 2. Define effect based on event
-    const eventEffect = (current: Resources): Partial<Resources> => {
-       if (event.severity === 'BAD') {
-           return { gold: current.gold - 10, wood: current.wood - 10 };
-       } else if (event.severity === 'GOOD') {
-           return { gold: current.gold + 20, wood: current.wood + 20 };
-       }
-       return {};
-    };
+  // --- Real-time Game Loop ---
+  useEffect(() => {
+    if (!isPlaying) return;
 
-    // 3. Apply Turn Update (Economy + Event) via Store
-    nextTurn(eventEffect);
-    setAiLoading(false);
-  };
+    const interval = setInterval(() => {
+        // 1. Advance Economy (Passive Income)
+        tick();
+    }, TICK_RATE_MS);
+
+    return () => clearInterval(interval);
+  }, [isPlaying, tick]);
 
   const handleCloseEvent = () => {
     setLastEvent(null);
@@ -82,7 +78,7 @@ function App() {
             shadow-mapSize={[1024, 1024]} 
         />
         
-        {/* Game World - Logic now inside GameMap interacting with Store */}
+        {/* Game World */}
         <GameMap />
         
         {/* Visual Cursors */}
@@ -105,10 +101,10 @@ function App() {
         selectedUnitMode={selectedUnitMode}
         setUnitMode={setUnitMode}
         turn={turn}
-        onNextTurn={handleNextTurn}
+        isPlaying={isPlaying}
+        onTogglePause={togglePause}
         lastEvent={lastEvent}
         onCloseEvent={handleCloseEvent}
-        isLoading={aiLoading}
       />
     </div>
   );
