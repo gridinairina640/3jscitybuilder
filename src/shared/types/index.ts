@@ -38,7 +38,7 @@ export interface UnitStats {
   range: number;
 }
 
-export type EntityState = 'IDLE' | 'MOVING' | 'ATTACKING' | 'WORKING' | 'RETURNING';
+export type EntityState = 'IDLE' | 'MOVING' | 'ATTACKING' | 'WORKING' | 'RETURNING' | 'GATHERING';
 
 /**
  * Основная игровая сущность (Здание или Юнит).
@@ -61,6 +61,7 @@ export interface GameEntity {
   currentRange?: number;     // Оставшийся запас хода
   maxRange?: number;         // Максимальный радиус действия
   visitedTiles?: Coordinates[]; // История последних посещенных клеток (Random Walk memory)
+  inventory?: { resource: 'wood' | 'gold'; amount: number } | null; // Inventory for workers
   
   // --- Patrol Mechanics (Buildings & Units) ---
   patrolPath?: Coordinates[]; // Маршрут патрулирования (для зданий) или активный путь (для юнитов)

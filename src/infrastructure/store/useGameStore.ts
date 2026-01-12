@@ -14,7 +14,7 @@ import { UnitType, UNIT_COSTS, UNIT_STATS } from '../../entities/Units';
 import { calculateTurnIncome } from '../../core/systems/EconomySystem';
 import { pathfindingService } from '../../core/utils/pathfinding';
 import { pathfindingScheduler, Priority } from '../../core/utils/pathfindingScheduler';
-import { processWalkerDecision } from '../../core/systems/WalkerSystem';
+import { processWalkerDecision, findNearestTileType } from '../../core/systems/WalkerSystem';
 
 interface GameState {
   // --- State ---
@@ -138,31 +138,46 @@ export const useGameStore = create<GameState>((set, get) => ({
     const state = get();
     const unit = state.entities.find(e => e.id === unitId);
     
-    // Only process AI for Idle units or units that just finished a step in a random walk chain
-    if (!unit || unit.faction !== 'PLAYER') return;
+    // Only process AI for units that are Idle or Just Finished Step (and are not moving)
+    if (!unit || unit.faction !== 'PLAYER' || (unit.path && unit.path.length > 0)) return;
     
     // Identify Parent
     const parentBuilding = unit.homeId 
         ? state.entities.find(e => e.id === unit.homeId)
         : undefined;
 
-    const decision = await processWalkerDecision(unit, parentBuilding, state.entities, pathfindingService);
+    const decision = await processWalkerDecision(unit, parentBuilding, state.entities, state.tiles, pathfindingService);
     
     if (!decision) return;
 
-    // Apply Decision
+    // Apply Decision State Updates
     set(s => ({
         entities: s.entities.map(e => e.id === unitId ? { ...e, ...decision } : e)
     }));
+    
+    // Apply Resource Drops (Economy Update)
+    if (decision.resourceDrop) {
+        set(s => ({
+            resources: {
+                ...s.resources,
+                [decision.resourceDrop!.resource]: s.resources[decision.resourceDrop!.resource] + decision.resourceDrop!.amount
+            }
+        }));
+    }
 
-    // If decision involves complex pathfinding (Return Home / Patrol to Waypoint)
+    // If decision involves complex pathfinding (Return Home / Patrol to Waypoint / Go to Resource)
     if (decision.isCalculatingPath) {
         let target: Coordinates | undefined;
         
+        // Target Logic
         if (decision.state === 'RETURNING' && parentBuilding) {
             target = parentBuilding.position;
         } else if (parentBuilding?.patrolPath && decision.patrolIndex !== undefined) {
             target = parentBuilding.patrolPath[decision.patrolIndex];
+        } else if (decision.state === 'MOVING' && unit.type === UnitType.WORKER && parentBuilding?.type === BuildingType.LUMBER_MILL) {
+             // Lumberjack looking for forest
+             const nearestForest = findNearestTileType(unit.position, TileType.FOREST, state.tiles);
+             if (nearestForest) target = nearestForest;
         }
 
         if (target) {

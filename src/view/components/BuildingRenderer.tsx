@@ -96,6 +96,14 @@ const UnitInstance: React.FC<{ entity: GameEntity, isSelected: boolean }> = ({ e
                 <meshStandardMaterial color={color} />
             </mesh>
 
+            {/* Carrying Inventory Indicator */}
+            {entity.inventory && entity.inventory.amount > 0 && (
+                <mesh position={[0, 0.6, 0]}>
+                    <boxGeometry args={[0.2, 0.1, 0.4]} />
+                    <meshStandardMaterial color={entity.inventory.resource === 'wood' ? '#5D4037' : '#FFD700'} />
+                </mesh>
+            )}
+
             {/* Selection Ring */}
             {isSelected && (
                 <mesh position={[0, -0.4, 0]} rotation={[-Math.PI/2, 0, 0]}>
