@@ -16,6 +16,7 @@
 
 import { TileData, TileType } from '../../entities/Map';
 import { Coordinates } from '../../shared/types';
+import { LRUCache } from './lruCache';
 
 // REFERENCE: High-performance A* Pathfinding (v3.17.0)
 // Improvements (v3.17.0):
@@ -23,6 +24,8 @@ import { Coordinates } from '../../shared/types';
 // - Perf: Pre-calculated cross-product constants.
 // - Logic: Explicit start node initialization.
 // - Safety: Stricter stale data checks.
+// Improvements (v3.18.0):
+// - Arch: Integrated LRUCache for O(1) cache management.
 
 const COSTS = {
   ROAD: 0.5,
@@ -205,7 +208,8 @@ export class PathfindingService {
   private startGridX: number = 0;
   private startGridZ: number = 0;
   
-  private pathCache: Map<string, { path: Coordinates[]; version: number }> = new Map();
+  // Implementation change: Use LRUCache instead of Map for O(1) eviction
+  private pathCache: LRUCache<string, { path: Coordinates[]; version: number }>;
   private maxCacheSize: number = 2000;
   
   private bufferPool: ComputeBuffers[] = [];
@@ -219,6 +223,7 @@ export class PathfindingService {
 
   constructor() {
     this.grid = new Float32Array(0);
+    this.pathCache = new LRUCache(this.maxCacheSize);
   }
 
   public syncWithStore(tiles: TileData[], size: number): void {
@@ -249,7 +254,10 @@ export class PathfindingService {
 
     this.bufferPool = [];
     this.gridVersion++;
+    
+    // Clear cache as grid changed
     this.pathCache.clear();
+    
     this.globalSearchId = 0; 
     this.cacheHits = 0;
     this.cacheMisses = 0;
@@ -264,6 +272,8 @@ export class PathfindingService {
     if (this.grid[idx] !== weight) {
        this.grid[idx] = weight;
        this.gridVersion++;
+       // Note: We don't clear the whole cache on single update, 
+       // but we rely on version checking in getPath to invalidate old paths.
     }
   }
 
@@ -294,11 +304,11 @@ export class PathfindingService {
       const cacheKey = this.getPathKey(start, end, options);
       if (cacheKey.startsWith('INV:')) return null;
 
+      // LRUCache.get automatically promotes the item to MRU
       const cached = this.pathCache.get(cacheKey);
+      
       if (cached && cached.version === this.gridVersion) {
           this.cacheHits++;
-          this.pathCache.delete(cacheKey);
-          this.pathCache.set(cacheKey, cached);
           return { 
             path: [...cached.path], 
             status: 'success',
@@ -320,8 +330,6 @@ export class PathfindingService {
         const cached = this.pathCache.get(cacheKey);
         if (cached && cached.version === this.gridVersion) {
             this.cacheHits++;
-            this.pathCache.delete(cacheKey);
-            this.pathCache.set(cacheKey, cached);
             return { path: [...cached.path], status: 'success', metrics: { iterations: 0, duration: 0, cached: true } };
         }
     }
@@ -360,11 +368,8 @@ export class PathfindingService {
         const duration = performance.now() - startTime;
         
         if (result.status === 'success' && !cacheKey.startsWith('INV:')) {
-          if (this.pathCache.size >= this.maxCacheSize) {
-              const oldestKey = this.pathCache.keys().next().value;
-              if (oldestKey) this.pathCache.delete(oldestKey);
-          }
-          this.pathCache.set(cacheKey, { path: result.path, version: this.gridVersion });
+          // LRUCache handles eviction automatically if capacity is exceeded
+          this.pathCache.put(cacheKey, { path: result.path, version: this.gridVersion });
         }
         
         return {
@@ -518,10 +523,6 @@ export class PathfindingService {
     
     if (failToClosest) {
          if (closestNodeIdx === startIdx) return { path: [], status: 'no_path', iterations };
-         
-         // Fallback: If parent not set (stale), try to find ANY closed path to it?
-         // Since we enforce strict ID check in reconstructPath, simply calling it is safe.
-         // If it fails, it returns partial path or empty.
          return { 
              path: this.reconstructPath(closestNodeIdx, parentIndex, includeStart, nodeTags, currentId), 
              status: 'partial_path', 
