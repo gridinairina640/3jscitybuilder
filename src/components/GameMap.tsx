@@ -8,9 +8,11 @@
 
 import React from 'react';
 import * as THREE from 'three';
+import { useFrame } from '@react-three/fiber';
 import { useGameStore } from '../infrastructure/store/useGameStore';
 import { MapTerrain } from '../view/components/MapTerrain';
 import { BuildingRenderer } from '../view/components/BuildingRenderer';
+import { pathfindingScheduler } from '../core/utils/pathfindingScheduler';
 
 export const GameMap: React.FC = () => {
   const tiles = useGameStore(state => state.tiles);
@@ -25,6 +27,13 @@ export const GameMap: React.FC = () => {
   const recruitUnit = useGameStore(state => state.recruitUnit);
   const selectEntity = useGameStore(state => state.selectEntity);
   const setUnitTarget = useGameStore(state => state.setUnitTarget);
+
+  // --- Scheduler Integration ---
+  // Process pathfinding queue every frame with a 2ms budget.
+  // This keeps the UI responsive even with many units requesting paths.
+  useFrame(() => {
+    pathfindingScheduler.tick(2);
+  });
 
   const handleTileClick = (x: number, z: number) => {
     // 1. Build Mode

@@ -13,6 +13,7 @@ import { BuildingType, BUILD_COSTS } from '../../entities/Buildings';
 import { UnitType, UNIT_COSTS, UNIT_STATS } from '../../entities/Units';
 import { calculateTurnIncome } from '../../core/systems/EconomySystem';
 import { pathfindingService } from '../../core/utils/pathfinding';
+import { pathfindingScheduler, Priority } from '../../core/utils/pathfindingScheduler';
 
 interface GameState {
   // --- State ---
@@ -46,7 +47,7 @@ interface GameState {
   
   // --- Gameplay Actions ---
   buildEntity: (x: number, z: number) => void;
-  recruitUnit: (x: number, z: number) => void;
+  recruitUnit: (x: number, z: number) => Promise<void>;
   setUnitTarget: (unitId: string, x: number, z: number) => Promise<void>;
   nextTurn: (eventEffect?: (current: Resources) => Partial<Resources>) => void;
 }
@@ -170,8 +171,8 @@ export const useGameStore = create<GameState>((set, get) => ({
     }
   },
 
-  recruitUnit: (x, z) => {
-    const { tiles, selectedUnitMode, resources } = get();
+  recruitUnit: async (x, z) => {
+    const { tiles, selectedUnitMode, resources, entities } = get();
     if (!selectedUnitMode) return;
 
     const tile = tiles.find(t => t.x === x && t.z === z);
@@ -179,17 +180,30 @@ export const useGameStore = create<GameState>((set, get) => ({
 
     const cost = UNIT_COSTS[selectedUnitMode];
     if (resources.gold >= (cost.gold || 0) && resources.wood >= (cost.wood || 0) && resources.population < resources.populationCap) {
+       
+       const unitId = uuidv4();
+
+       // 1. Identify Home (Building at spawn location)
+       const homeBuilding = entities.find(e => 
+            Math.round(e.position.x) === x && 
+            Math.round(e.position.z) === z &&
+            Object.values(BuildingType).includes(e.type as BuildingType)
+       );
+
+       // 2. Initial Setup
        const newEntity: GameEntity = {
-          id: uuidv4(),
+          id: unitId,
           type: selectedUnitMode,
           position: { x, z },
           health: selectedUnitMode === UnitType.HERO ? 200 : 50,
           maxHealth: selectedUnitMode === UnitType.HERO ? 200 : 50,
           faction: 'PLAYER',
           state: 'IDLE',
-          stats: UNIT_STATS[selectedUnitMode]
+          stats: UNIT_STATS[selectedUnitMode],
+          homeId: homeBuilding?.id
        };
 
+       // 3. Commit Spawn (Synchronous part)
        set(state => ({
           resources: {
             ...state.resources,
@@ -200,13 +214,69 @@ export const useGameStore = create<GameState>((set, get) => ({
           entities: [...state.entities, newEntity],
           selectedUnitMode: null
        }));
+
+       // 4. "Nebuchadnezzar Style": Try to establish a route immediately if applicable.
+       if (homeBuilding && selectedUnitMode === UnitType.WORKER) {
+           const targetBuilding = entities.find(e => 
+               e.id !== homeBuilding.id && 
+               (e.type === BuildingType.LUMBER_MILL || e.type === BuildingType.BARRACKS)
+           );
+
+           if (targetBuilding) {
+               // A) Try Static Cache first (Sync)
+               const staticPath = pathfindingService.getStaticPath(homeBuilding.id, targetBuilding.id);
+               
+               if (staticPath) {
+                   set(state => ({
+                       entities: state.entities.map(e => e.id === unitId ? {
+                           ...e,
+                           path: staticPath,
+                           state: 'MOVING',
+                           patrolPath: [targetBuilding.position]
+                       } : e)
+                   }));
+               } else {
+                   // B) Schedule pathfinding (Async)
+                   set(state => ({
+                       entities: state.entities.map(e => e.id === unitId ? { ...e, isCalculatingPath: true } : e)
+                   }));
+
+                   try {
+                       // Use Scheduler with MEDIUM priority for background workers
+                       const result = await pathfindingScheduler.schedule(
+                           homeBuilding.position,
+                           targetBuilding.position,
+                           { failToClosest: true },
+                           Priority.MEDIUM
+                       );
+
+                       if (result.status === 'success' || result.status === 'partial_path') {
+                           pathfindingService.saveStaticPath(homeBuilding.id, targetBuilding.id, result.path);
+                           
+                           set(state => ({
+                               entities: state.entities.map(e => e.id === unitId ? {
+                                   ...e,
+                                   path: result.path,
+                                   state: 'MOVING',
+                                   isCalculatingPath: false,
+                                   patrolPath: [targetBuilding.position]
+                               } : e)
+                           }));
+                       } else {
+                           set(state => ({
+                               entities: state.entities.map(e => e.id === unitId ? { ...e, isCalculatingPath: false } : e)
+                           }));
+                       }
+                   } catch (e) {
+                       console.error("Path calculation failed", e);
+                   }
+               }
+           }
+       }
     }
   },
 
   setUnitTarget: async (unitId: string, x: number, z: number) => {
-      // NOTE: We don't check isWalkable here anymore because findPath
-      // with failToClosest: true handles unreachable targets.
-      
       const { entities } = get();
       const unit = entities.find(e => e.id === unitId);
       if (!unit) return;
@@ -218,11 +288,12 @@ export const useGameStore = create<GameState>((set, get) => ({
       }));
 
       try {
-          // Enable failToClosest for better UX (RTS style movement)
-          const result = await pathfindingService.findPath(
+          // Use Scheduler with HIGH priority for direct user commands
+          const result = await pathfindingScheduler.schedule(
               unit.position, 
               { x, z }, 
-              { failToClosest: true }
+              { failToClosest: true },
+              Priority.HIGH
           );
           
           if (result.status === 'success' || result.status === 'partial_path') {
@@ -255,9 +326,6 @@ export const useGameStore = create<GameState>((set, get) => ({
 
   nextTurn: (eventEffect) => {
     set(state => {
-      // Note: Movement is now Real-time, handled by completeMoveStep and View layer.
-      // nextTurn only handles Economy and Events (Seasons).
-      
       const income = calculateTurnIncome(state.entities);
       let newResources = {
         ...state.resources,

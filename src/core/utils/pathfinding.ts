@@ -17,14 +17,11 @@
 import { TileData, TileType } from '../../entities/Map';
 import { Coordinates } from '../../shared/types';
 
-// REFERENCE: High-performance A* Pathfinding (v3.9.0)
-// Improvements (v3.9.0) based on Deep Technical Review:
-// - Added Float32 gScore overflow protection (> 1e7).
-// - Added Cache Hit/Miss metrics.
-// - Optimized fillNeighborsBuffer (precalculated row offsets).
-// - Refined tie-breaking documentation and epsilon usage.
-// - Added Bresenham Line-of-Sight Check (Optional - Placeholder for now).
-// - Split large method logic for better readability.
+// REFERENCE: High-performance A* Pathfinding (v3.10.0)
+// Improvements (v3.10.0):
+// - Added Static Path Caching (Nebuchadnezzar Style).
+// - Added methods getStaticPath / saveStaticPath for persistent routes between entities.
+// - Static paths use lazy invalidation via gridVersion check.
 
 const COSTS = {
   ROAD: 0.5,
@@ -196,6 +193,9 @@ class FlatMinHeap {
     this.indices[j] = tempI;
     this.f[j] = tempF;
     this.g[j] = tempG;
+    this.indices[j] = tempI;
+    this.f[j] = tempF;
+    this.g[j] = tempG;
   }
 }
 
@@ -273,6 +273,71 @@ export class PathfindingService {
     return Number.isFinite(this.grid[idx]);
   }
 
+  /**
+   * Получает статический маршрут между двумя зданиями/сущностями.
+   * Проверяет gridVersion для ленивой инвалидации.
+   */
+  public getStaticPath(fromId: string, toId: string): Coordinates[] | null {
+      const key = `static:${fromId}:${toId}`;
+      const cached = this.pathCache.get(key);
+
+      if (cached && cached.version === this.gridVersion) {
+          this.cacheHits++;
+          return [...cached.path];
+      }
+      
+      if (cached) {
+          this.cacheMisses++; // Version mismatch
+      }
+
+      return null;
+  }
+
+  /**
+   * Публичный метод для проверки кэша (используется планировщиком).
+   */
+  public checkCache(start: Coordinates, end: Coordinates, options: PathOptions = {}): PathResult | null {
+      const sIdx = this.toIndex(start.x, start.z);
+      const eIdx = this.toIndex(end.x, end.z);
+      
+      if (sIdx === -1 || eIdx === -1) return null;
+
+      const hWeight = options.heuristicWeight ?? 1.0;
+      const includeStart = options.includeStartNode ?? false;
+      const failToClosest = options.failToClosest ?? false;
+      
+      const safeHWeight = Math.round(hWeight * 100) / 100;
+      const cacheKey = `${sIdx}-${eIdx}-${safeHWeight}-${includeStart}-${failToClosest}`;
+
+      const cached = this.pathCache.get(cacheKey);
+      if (cached && cached.version === this.gridVersion) {
+          this.cacheHits++;
+          return { 
+            path: [...cached.path], 
+            status: 'success',
+            metrics: { iterations: 0, duration: 0, cached: true, cacheHits: this.cacheHits, cacheMisses: this.cacheMisses } 
+          };
+      }
+      return null;
+  }
+
+  /**
+   * Сохраняет статический маршрут между сущностями.
+   */
+  public saveStaticPath(fromId: string, toId: string, path: Coordinates[]): void {
+      const key = `static:${fromId}:${toId}`;
+      
+      if (this.pathCache.size >= this.maxCacheSize) {
+          const firstKey = this.pathCache.keys().next().value;
+          if (firstKey) this.pathCache.delete(firstKey);
+      }
+
+      this.pathCache.set(key, {
+          path: path,
+          version: this.gridVersion
+      });
+  }
+
   public async findPath(
       start: Coordinates, 
       end: Coordinates, 
@@ -280,50 +345,44 @@ export class PathfindingService {
   ): Promise<PathResult> {
     const startTime = performance.now();
     
+    // Check Cache immediately (Redundant if called via Scheduler, but safe for direct calls)
+    const cachedResult = this.checkCache(start, end, options);
+    if (cachedResult) return cachedResult;
+
     if (options.signal?.aborted) return { path: [], status: 'aborted' };
 
+    const sIdx = this.toIndex(start.x, start.z);
+    const eIdx = this.toIndex(end.x, end.z);
+    
+    // Validation
     if (!Number.isFinite(start.x) || !Number.isFinite(start.z) || 
         !Number.isFinite(end.x) || !Number.isFinite(end.z)) {
         return { path: [], status: 'invalid_args' };
     }
-
-    const sIdx = this.toIndex(start.x, start.z);
-    const eIdx = this.toIndex(end.x, end.z);
-    const safetyLimit = Math.max(this.totalTiles * 2, 50000);
-    const maxIter = Math.min(options.maxIterations ?? this.defaultMaxIterations, safetyLimit);
-    const hWeight = options.heuristicWeight ?? 1.0;
-    const includeStart = options.includeStartNode ?? false;
-    const failToClosest = options.failToClosest ?? false;
-
     if (sIdx === -1 || eIdx === -1) return { path: [], status: 'invalid_args' };
+    
+    // Short-circuits
+    const includeStart = options.includeStartNode ?? false;
     if (sIdx === eIdx) {
         const path = includeStart ? [{ ...end }] : [];
         return { path, status: 'success', metrics: { iterations: 0, duration: 0 } };
     }
     
+    const failToClosest = options.failToClosest ?? false;
     if (!Number.isFinite(this.grid[sIdx])) return { path: [], status: 'no_path' };
     if (!failToClosest && !Number.isFinite(this.grid[eIdx])) return { path: [], status: 'no_path' };
 
-    // Cache Check
+    // Set up search
+    this.cacheMisses++;
+    const buffers = this.acquireBuffers();
+    const safetyLimit = Math.max(this.totalTiles * 2, 50000);
+    const maxIter = Math.min(options.maxIterations ?? this.defaultMaxIterations, safetyLimit);
+    const hWeight = options.heuristicWeight ?? 1.0;
+    
+    // Cache Key reconstruction for saving later
     const safeHWeight = Math.round(hWeight * 100) / 100;
     const cacheKey = `${sIdx}-${eIdx}-${safeHWeight}-${includeStart}-${failToClosest}`;
-    
-    const cached = this.pathCache.get(cacheKey);
-    if (cached && cached.version === this.gridVersion) {
-        this.cacheHits++;
-        const duration = performance.now() - startTime;
-        this.pathCache.delete(cacheKey);
-        this.pathCache.set(cacheKey, cached);
-        return { 
-            path: cached.path, 
-            status: 'success',
-            metrics: { iterations: 0, duration, cached: true, cacheHits: this.cacheHits, cacheMisses: this.cacheMisses } 
-        };
-    }
-    this.cacheMisses++;
 
-    const buffers = this.acquireBuffers();
-    
     try {
         const result = this.calculateAStar(
             sIdx, eIdx, maxIter, hWeight, includeStart, failToClosest, 
@@ -450,7 +509,6 @@ export class PathfindingService {
     if (failToClosest) {
          if (closestNodeIdx === startIdx) return { path: [], status: 'no_path', iterations };
          
-         // Safety check: verify we actually have a path to closestNodeIdx
          if (parentIndex[closestNodeIdx] === -1 && closestNodeIdx !== startIdx) {
              console.warn("[Pathfinding] Closest node found but has no parent. Returning no_path.");
              return { path: [], status: 'no_path', iterations };
@@ -517,22 +575,14 @@ export class PathfindingService {
   }
 
   private fillNeighborsBuffer(idx: number, buffer: Int32Array): number {
-    // Optimized: reduced modulo operations.
-    // x = idx % size
-    // But we can check bounds using idx directly if we know the row range.
-    
     const size = this.size;
     const total = this.totalTiles;
-    const x = idx % size; // Still needed for Left/Right wrapping checks
+    const x = idx % size; 
     let count = 0;
 
-    // Left
     if (x > 0) buffer[count++] = idx - 1;
-    // Right
     if (x < size - 1) buffer[count++] = idx + 1;
-    // Top
     if (idx >= size) buffer[count++] = idx - size;
-    // Bottom
     if (idx < total - size) buffer[count++] = idx + size;
 
     return count;
