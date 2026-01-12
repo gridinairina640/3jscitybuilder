@@ -7,7 +7,7 @@
  * COORDINATE SYSTEM:
  * - World Coordinates: Float or Integer, centered at (0,0). 1 unit = 1 tile.
  * - Grid Coordinates: Integer indices [0..size-1].
- * - Conversion: Grid = Math.floor(World + 0.5) + halfSize.
+ * - Conversion: Grid = Math.round(World) + halfSize.
  * 
  * API CONTRACT:
  * - findPath returns a PathResult object containing the path and status.
@@ -17,12 +17,12 @@
 import { TileData, TileType } from '../../entities/Map';
 import { Coordinates } from '../../shared/types';
 
-// REFERENCE: High-performance A* Pathfinding (v3.11.0)
-// Improvements (v3.11.0):
-// - Fixed FlatMinHeap swap bug.
-// - Added Synchronous API (findPathSync) for Scheduler integration.
-// - Added Heuristic Tie-Breaking (Cross Product) for straighter paths.
-// - checkCache exposed for Scheduler.
+// REFERENCE: High-performance A* Pathfinding (v3.12.0)
+// Improvements (v3.12.0):
+// - Memory: Merged nodeState & closedSet into single Uint32Array (bitmasking).
+// - Perf: Inlined heuristic calculation inside hot loop.
+// - Precision: Improved cache key generation and coordinate rounding.
+// - Logic: Fixed Admissibility concerns with Cross Product.
 
 const COSTS = {
   ROAD: 0.5,
@@ -37,6 +37,13 @@ const EPSILON = 1e-5;
 
 // Warning threshold for gScore in Float32 to avoid precision loss issues
 const FLOAT32_SAFE_LIMIT = 1e7;
+
+// Bitmasks for NodeTags
+// Structure: [SearchID (30 bits) | State (2 bits)]
+const STATE_NONE = 0;
+const STATE_OPEN = 1;
+const STATE_CLOSED = 2;
+const MAX_SEARCH_ID = 0x3FFFFFFF; // 30 bits max
 
 export type NavigationLayer = TileType | 'ROAD' | 'BUILDING';
 
@@ -78,8 +85,7 @@ const MAX_NEIGHBORS = 4;
 interface ComputeBuffers {
   gScore: Float32Array; 
   parentIndex: Int32Array; 
-  nodeState: Uint32Array; 
-  closedSet: Uint32Array; 
+  nodeTags: Uint32Array; // Combined ID and State
   heap: FlatMinHeap;
   neighbors: Int32Array; 
 }
@@ -144,7 +150,7 @@ class FlatMinHeap {
       
       if (cf > pf + EPSILON) break;
       
-      // Tie-breaking: Prefer Higher G (closer to target in most heuristics)
+      // Tie-breaking: Prefer Higher G
       if (Math.abs(cf - pf) < EPSILON) {
          if (this.g[idx] <= this.g[parentIdx]) break;
       }
@@ -301,7 +307,8 @@ export class PathfindingService {
       const includeStart = options.includeStartNode ?? false;
       const failToClosest = options.failToClosest ?? false;
       
-      const safeHWeight = Math.round(hWeight * 100) / 100;
+      // Increased precision for cache key to prevent collisions (1.001 vs 1.000)
+      const safeHWeight = Math.round(hWeight * 1000) / 1000;
       const cacheKey = `${sIdx}-${eIdx}-${safeHWeight}-${includeStart}-${failToClosest}`;
 
       const cached = this.pathCache.get(cacheKey);
@@ -330,10 +337,6 @@ export class PathfindingService {
       });
   }
 
-  /**
-   * Synchronous pathfinding execution.
-   * This method blocks the thread until completion or timeout.
-   */
   public findPathSync(
       start: Coordinates, 
       end: Coordinates, 
@@ -341,7 +344,6 @@ export class PathfindingService {
   ): PathResult {
     const startTime = performance.now();
     
-    // 1. Check Cache
     const cachedResult = this.checkCache(start, end, options);
     if (cachedResult) return cachedResult;
 
@@ -350,10 +352,8 @@ export class PathfindingService {
     const sIdx = this.toIndex(start.x, start.z);
     const eIdx = this.toIndex(end.x, end.z);
     
-    // 2. Validation
     if (sIdx === -1 || eIdx === -1) return { path: [], status: 'invalid_args' };
     
-    // 3. Store State for Heuristic Tie-Breaking
     this.startGridX = this.toGridX(start.x);
     this.startGridZ = this.toGridZ(start.z);
 
@@ -367,14 +367,13 @@ export class PathfindingService {
     if (!Number.isFinite(this.grid[sIdx])) return { path: [], status: 'no_path' };
     if (!failToClosest && !Number.isFinite(this.grid[eIdx])) return { path: [], status: 'no_path' };
 
-    // 4. Execution
     this.cacheMisses++;
     const buffers = this.acquireBuffers();
     const safetyLimit = Math.max(this.totalTiles * 2, 50000);
     const maxIter = Math.min(options.maxIterations ?? this.defaultMaxIterations, safetyLimit);
     const hWeight = options.heuristicWeight ?? 1.0;
     
-    const safeHWeight = Math.round(hWeight * 100) / 100;
+    const safeHWeight = Math.round(hWeight * 1000) / 1000;
     const cacheKey = `${sIdx}-${eIdx}-${safeHWeight}-${includeStart}-${failToClosest}`;
 
     try {
@@ -409,9 +408,6 @@ export class PathfindingService {
     }
   }
 
-  /**
-   * Async wrapper for API compatibility.
-   */
   public async findPath(start: Coordinates, end: Coordinates, options: PathOptions = {}): Promise<PathResult> {
       return this.findPathSync(start, end, options);
   }
@@ -426,13 +422,13 @@ export class PathfindingService {
       buffers: ComputeBuffers,
       signal?: AbortSignal
   ): { path: Coordinates[], status: PathStatus, iterations: number } {
-    const { gScore, parentIndex, closedSet, nodeState, heap, neighbors } = buffers;
+    const { gScore, parentIndex, nodeTags, heap, neighbors } = buffers;
 
+    // Handle Search ID Overflow
     this.globalSearchId++;
-    if (this.globalSearchId >= 0xFFFFFFF0) {
+    if (this.globalSearchId >= MAX_SEARCH_ID) {
         this.globalSearchId = 1;
-        nodeState.fill(0);
-        closedSet.fill(0);
+        nodeTags.fill(0);
         gScore.fill(Infinity);
         parentIndex.fill(-1);
     }
@@ -441,13 +437,31 @@ export class PathfindingService {
     heap.clear();
     gScore[startIdx] = 0;
     parentIndex[startIdx] = -1;
-    nodeState[startIdx] = currentId;
+    // Mark Open: (ID << 2) | STATE_OPEN
+    nodeTags[startIdx] = (currentId << 2) | STATE_OPEN;
     
-    heap.push(startIdx, this.heuristic(startIdx, endIdx) * heuristicWeight, 0);
+    // Initial Heuristic (Manhattan)
+    const size = this.size;
+    const sx = startIdx % size;
+    const sz = (startIdx / size) | 0;
+    const ex = endIdx % size;
+    const ez = (endIdx / size) | 0;
+    const initH = (Math.abs(sx - ex) + Math.abs(sz - ez)) * this.minStepCost;
+
+    heap.push(startIdx, initH * heuristicWeight, 0);
 
     let iterations = 0;
     let closestNodeIdx = startIdx;
     let minH = Infinity;
+
+    // Tie-Breaker Constants pre-calculated for inline use
+    const startGX = this.startGridX;
+    const startGZ = this.startGridZ;
+    const minStep = this.minStepCost;
+    
+    // Vector Start->End
+    const dx1 = ex - startGX;
+    const dz1 = ez - startGZ;
 
     while (!heap.isEmpty()) {
       iterations++;
@@ -457,20 +471,32 @@ export class PathfindingService {
       const current = heap.pop()!;
       const currentIdx = current.index;
       
-      // Lazy deletion check: if we found a better G for this node already, skip old heap entry
-      if (nodeState[currentIdx] === currentId && current.g > gScore[currentIdx]) continue;
+      const tagVal = nodeTags[currentIdx];
+      const tagId = tagVal >>> 2;
+      const tagState = tagVal & 3;
+
+      // Lazy deletion check:
+      // If node is current search ID AND it is already CLOSED, skip.
+      // If node is current search ID AND OPEN, check if G is worse than stored.
+      if (tagId === currentId) {
+          if (tagState === STATE_CLOSED) continue;
+          if (current.g > gScore[currentIdx]) continue;
+      }
       
+      // Update closest for failToClosest
       if (failToClosest) {
-          // Note: using basic manhattan for quick fail check
-          const h = this.heuristic(currentIdx, endIdx); 
+          // Manhattan inline
+          const cX = currentIdx % size;
+          const cZ = (currentIdx / size) | 0;
+          const h = (Math.abs(cX - ex) + Math.abs(cZ - ez)) * minStep;
           if (h < minH) {
               minH = h;
               closestNodeIdx = currentIdx;
           }
       }
 
-      if (closedSet[currentIdx] === currentId) continue;
-      closedSet[currentIdx] = currentId;
+      // Mark Closed
+      nodeTags[currentIdx] = (currentId << 2) | STATE_CLOSED;
 
       if (currentIdx === endIdx) {
         return { path: this.reconstructPath(endIdx, parentIndex, includeStart), status: 'success', iterations };
@@ -480,15 +506,19 @@ export class PathfindingService {
       
       for (let i = 0; i < count; i++) {
         const neighborIdx = neighbors[i];
-        if (closedSet[neighborIdx] === currentId) continue;
+        
+        // Check if Closed without full array access
+        const nTag = nodeTags[neighborIdx];
+        if ((nTag >>> 2) === currentId && (nTag & 3) === STATE_CLOSED) continue;
         
         const weight = this.grid[neighborIdx];
         if (!Number.isFinite(weight)) continue;
 
-        if (nodeState[neighborIdx] !== currentId) {
+        // If new node, reset G
+        if ((nTag >>> 2) !== currentId) {
             gScore[neighborIdx] = Infinity;
             parentIndex[neighborIdx] = -1;
-            nodeState[neighborIdx] = currentId;
+            // No need to set tag here, will be set on heap push (Open)
         }
 
         const tentativeG = current.g + weight;
@@ -498,8 +528,27 @@ export class PathfindingService {
         if (tentativeG < gScore[neighborIdx]) {
           parentIndex[neighborIdx] = currentIdx;
           gScore[neighborIdx] = tentativeG;
-          const f = tentativeG + (this.heuristic(neighborIdx, endIdx) * heuristicWeight);
+          
+          // INLINE HEURISTIC CALCULATION
+          const nx = neighborIdx % size;
+          const nz = (neighborIdx / size) | 0;
+          
+          // 1. Basic Manhattan
+          let h = (Math.abs(nx - ex) + Math.abs(nz - ez)) * minStep;
+          
+          // 2. Tie-Breaking: Cross-Product (Inline)
+          // Only add small penalty to straighten paths
+          const dx2 = nx - startGX;
+          const dz2 = nz - startGZ;
+          const cross = Math.abs(dx1 * dz2 - dx2 * dz1);
+          h += cross * 0.0001;
+
+          const f = tentativeG + (h * heuristicWeight);
+          
           heap.push(neighborIdx, f, tentativeG);
+          
+          // Mark Open
+          nodeTags[neighborIdx] = (currentId << 2) | STATE_OPEN;
         }
       }
     }
@@ -519,8 +568,7 @@ export class PathfindingService {
       return {
           gScore: new Float32Array(size),
           parentIndex: new Int32Array(size),
-          nodeState: new Uint32Array(size),
-          closedSet: new Uint32Array(size),
+          nodeTags: new Uint32Array(size), // Combined
           heap: new FlatMinHeap(Math.max(16, (size / 4) | 0)),
           neighbors: new Int32Array(MAX_NEIGHBORS)
       };
@@ -538,34 +586,6 @@ export class PathfindingService {
   private releaseBuffers(buffers: ComputeBuffers) {
       this.activeSearches--;
       if (this.bufferPool.length < this.maxPoolSize) this.bufferPool.push(buffers);
-  }
-
-  private heuristic(currentIdx: number, targetIdx: number): number {
-    const ax = currentIdx % this.size;
-    const az = (currentIdx / this.size) | 0;
-    const bx = targetIdx % this.size;
-    const bz = (targetIdx / this.size) | 0;
-    
-    // 1. Basic Manhattan
-    const h = (Math.abs(ax - bx) + Math.abs(az - bz)) * this.minStepCost;
-    
-    // 2. Tie-Breaking: Cross-Product
-    // Prevents "zigzag" on large open areas by preferring nodes closer to the straight line Start->End
-    // Vector 1: Start -> End (dx1, dz1)
-    // Vector 2: Start -> Current (dx2, dz2)
-    const sx = this.startGridX;
-    const sz = this.startGridZ;
-    
-    const dx1 = bx - sx;
-    const dz1 = bz - sz;
-    const dx2 = ax - sx;
-    const dz2 = az - sz;
-    
-    // Cross product magnitude
-    const cross = Math.abs(dx1 * dz2 - dx2 * dz1);
-    
-    // Add small penalty. 0.001 is small enough not to break admissibility significantly for integer grids
-    return h + cross * 0.001;
   }
 
   private reconstructPath(endIdx: number, parentIndex: Int32Array, includeStart: boolean): Coordinates[] {
@@ -604,11 +624,11 @@ export class PathfindingService {
   }
 
   private toGridX(worldX: number): number {
-    return (Math.floor(worldX + 0.5) + this.halfSize) | 0;
+    return Math.round(worldX) + this.halfSize;
   }
 
   private toGridZ(worldZ: number): number {
-    return (Math.floor(worldZ + 0.5) + this.halfSize) | 0;
+    return Math.round(worldZ) + this.halfSize;
   }
 
   private toWorldX(gridX: number): number {

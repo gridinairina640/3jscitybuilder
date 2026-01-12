@@ -14,6 +14,7 @@ import { UnitType, UNIT_COSTS, UNIT_STATS } from '../../entities/Units';
 import { calculateTurnIncome } from '../../core/systems/EconomySystem';
 import { pathfindingService } from '../../core/utils/pathfinding';
 import { pathfindingScheduler, Priority } from '../../core/utils/pathfindingScheduler';
+import { processWalkerDecision } from '../../core/systems/WalkerSystem';
 
 interface GameState {
   // --- State ---
@@ -41,9 +42,9 @@ interface GameState {
   
   /**
    * Вызывается View-слоем, когда юнит визуально завершил перемещение на один тайл.
-   * Обновляет логическую позицию юнита в сетке.
+   * Обновляет логическую позицию юнита в сетке и запускает AI следующего шага.
    */
-  completeMoveStep: (unitId: string) => void;
+  completeMoveStep: (unitId: string) => Promise<void>;
   
   // --- Gameplay Actions ---
   buildEntity: (x: number, z: number) => void;
@@ -114,12 +115,12 @@ export const useGameStore = create<GameState>((set, get) => ({
     selectedUnitMode: null 
   }),
 
-  completeMoveStep: (unitId) => {
+  completeMoveStep: async (unitId) => {
+    // 1. Update Position (Synchronous)
     set(state => ({
       entities: state.entities.map(e => {
         if (e.id !== unitId || !e.path || e.path.length === 0) return e;
 
-        // Unit arrived at path[0].
         const nextPos = e.path[0];
         const remainingPath = e.path.slice(1);
         const newState = remainingPath.length === 0 ? 'IDLE' : 'MOVING';
@@ -132,6 +133,71 @@ export const useGameStore = create<GameState>((set, get) => ({
         };
       })
     }));
+
+    // 2. Walker AI Decision (Autonomous Behavior)
+    const state = get();
+    const unit = state.entities.find(e => e.id === unitId);
+    
+    // Only process AI for Idle units or units that just finished a step in a random walk chain
+    if (!unit || unit.faction !== 'PLAYER') return;
+    
+    // Identify Parent
+    const parentBuilding = unit.homeId 
+        ? state.entities.find(e => e.id === unit.homeId)
+        : undefined;
+
+    const decision = await processWalkerDecision(unit, parentBuilding, state.entities, pathfindingService);
+    
+    if (!decision) return;
+
+    // Apply Decision
+    set(s => ({
+        entities: s.entities.map(e => e.id === unitId ? { ...e, ...decision } : e)
+    }));
+
+    // If decision involves complex pathfinding (Return Home / Patrol to Waypoint)
+    if (decision.isCalculatingPath) {
+        let target: Coordinates | undefined;
+        
+        if (decision.state === 'RETURNING' && parentBuilding) {
+            target = parentBuilding.position;
+        } else if (parentBuilding?.patrolPath && decision.patrolIndex !== undefined) {
+            target = parentBuilding.patrolPath[decision.patrolIndex];
+        }
+
+        if (target) {
+            try {
+                // We use LOW priority for ambient walkers to not clog the queue
+                const result = await pathfindingScheduler.requestPath(
+                    unit.position,
+                    target,
+                    Priority.LOW, 
+                    { failToClosest: true }
+                );
+
+                if (result.status === 'success' || result.status === 'partial_path') {
+                     set(s => ({
+                        entities: s.entities.map(e => e.id === unitId ? {
+                            ...e,
+                            path: result.path,
+                            state: decision.state || 'MOVING',
+                            isCalculatingPath: false
+                        } : e)
+                    }));
+                } else {
+                     // Path failed, go IDLE
+                     set(s => ({
+                        entities: s.entities.map(e => e.id === unitId ? { ...e, state: 'IDLE', isCalculatingPath: false } : e)
+                    }));
+                }
+            } catch (e) {
+                console.warn("Walker path failed", e);
+                set(s => ({
+                    entities: s.entities.map(e => e.id === unitId ? { ...e, isCalculatingPath: false } : e)
+                }));
+            }
+        }
+    }
   },
 
   buildEntity: (x, z) => {
@@ -200,7 +266,11 @@ export const useGameStore = create<GameState>((set, get) => ({
           faction: 'PLAYER',
           state: 'IDLE',
           stats: UNIT_STATS[selectedUnitMode],
-          homeId: homeBuilding?.id
+          homeId: homeBuilding?.id,
+          // Walker Stats
+          maxRange: 50,
+          currentRange: 50,
+          visitedTiles: []
        };
 
        // 3. Commit Spawn (Synchronous part)
@@ -214,65 +284,9 @@ export const useGameStore = create<GameState>((set, get) => ({
           entities: [...state.entities, newEntity],
           selectedUnitMode: null
        }));
-
-       // 4. "Nebuchadnezzar Style": Try to establish a route immediately if applicable.
-       if (homeBuilding && selectedUnitMode === UnitType.WORKER) {
-           const targetBuilding = entities.find(e => 
-               e.id !== homeBuilding.id && 
-               (e.type === BuildingType.LUMBER_MILL || e.type === BuildingType.BARRACKS)
-           );
-
-           if (targetBuilding) {
-               // A) Try Static Cache first (Sync)
-               const staticPath = pathfindingService.getStaticPath(homeBuilding.id, targetBuilding.id);
-               
-               if (staticPath) {
-                   set(state => ({
-                       entities: state.entities.map(e => e.id === unitId ? {
-                           ...e,
-                           path: staticPath,
-                           state: 'MOVING',
-                           patrolPath: [targetBuilding.position]
-                       } : e)
-                   }));
-               } else {
-                   // B) Schedule pathfinding (Async)
-                   set(state => ({
-                       entities: state.entities.map(e => e.id === unitId ? { ...e, isCalculatingPath: true } : e)
-                   }));
-
-                   try {
-                       // Use Scheduler with MEDIUM priority for background workers
-                       const result = await pathfindingScheduler.requestPath(
-                           homeBuilding.position,
-                           targetBuilding.position,
-                           Priority.MEDIUM,
-                           { failToClosest: true }
-                       );
-
-                       if (result.status === 'success' || result.status === 'partial_path') {
-                           pathfindingService.saveStaticPath(homeBuilding.id, targetBuilding.id, result.path);
-                           
-                           set(state => ({
-                               entities: state.entities.map(e => e.id === unitId ? {
-                                   ...e,
-                                   path: result.path,
-                                   state: 'MOVING',
-                                   isCalculatingPath: false,
-                                   patrolPath: [targetBuilding.position]
-                               } : e)
-                           }));
-                       } else {
-                           set(state => ({
-                               entities: state.entities.map(e => e.id === unitId ? { ...e, isCalculatingPath: false } : e)
-                           }));
-                       }
-                   } catch (e) {
-                       console.error("Path calculation failed", e);
-                   }
-               }
-           }
-       }
+       
+       // Trigger initial logic
+       setTimeout(() => get().completeMoveStep(unitId), 100);
     }
   },
 
@@ -283,7 +297,7 @@ export const useGameStore = create<GameState>((set, get) => ({
 
       set(state => ({
           entities: state.entities.map(e => 
-              e.id === unitId ? { ...e, isCalculatingPath: true } : e
+              e.id === unitId ? { ...e, isCalculatingPath: true, state: 'MOVING' } : e
           )
       }));
 
@@ -303,7 +317,10 @@ export const useGameStore = create<GameState>((set, get) => ({
                         ...e, 
                         path: result.path, 
                         isCalculatingPath: false,
-                        state: 'MOVING' 
+                        state: 'MOVING',
+                        // Reset walker state on manual command
+                        currentRange: 50,
+                        visitedTiles: []
                     } : e
                 )
             }));

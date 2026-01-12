@@ -10,19 +10,28 @@ import { GameEntity, Coordinates } from '../../shared/types';
 import { BuildingType } from '../../entities/Buildings';
 import { PathfindingService } from '../utils/pathfinding';
 
-const HISTORY_SIZE = 5; // Количество запоминаемых последних клеток для предотвращения циклов
+const HISTORY_SIZE = 8; // Количество запоминаемых последних клеток для предотвращения циклов
 
 /**
- * Проверяет, является ли тайл дорогой.
- * В текущей архитектуре дороги — это сущности (Buildings) с типом ROAD.
+ * Проверяет, является ли тайл дорогой или зданием (проходимым для своих).
  */
-const isRoadTile = (x: number, z: number, entities: GameEntity[]): boolean => {
+const isWalkableTarget = (x: number, z: number, entities: GameEntity[]): boolean => {
   return entities.some(e => 
-    e.type === BuildingType.ROAD && 
+    (e.type === BuildingType.ROAD || Object.values(BuildingType).includes(e.type as BuildingType)) && 
     Math.round(e.position.x) === x && 
     Math.round(e.position.z) === z
   );
 };
+
+export interface WalkerDecision {
+    state?: 'IDLE' | 'MOVING' | 'RETURNING' | 'WORKING';
+    path?: Coordinates[];
+    patrolIndex?: number;
+    currentRange?: number;
+    visitedTiles?: Coordinates[];
+    isCalculatingPath?: boolean;
+    despawn?: boolean;
+}
 
 /**
  * Основная функция принятия решений для юнита-рабочего.
@@ -33,123 +42,91 @@ export const processWalkerDecision = async (
   parentBuilding: GameEntity | undefined,
   allEntities: GameEntity[],
   pathfinding: PathfindingService
-): Promise<Partial<GameEntity> | null> => {
+): Promise<WalkerDecision | null> => {
   
-  // 1. Блокирующие проверки
-  if (walker.isCalculatingPath) return null; // Ждем завершения A*
-  if (walker.path && walker.path.length > 0) return null; // Юнит еще идет по пути
+  if (walker.isCalculatingPath) return null;
+  if (walker.path && walker.path.length > 0) return null;
 
-  // 2. Логика возврата домой
+  // 1. Logic: Arrived Home (Returning State)
   if (walker.state === 'RETURNING') {
-    // Если мы здесь, значит путь пуст (path.length === 0), то есть юнит пришел домой.
-    // Логика "исчезновения" или сброса ресурсов должна быть обработана вне этой системы.
-    // Мы просто сбрасываем состояние.
-    return {
-      state: 'IDLE',
-      currentRange: walker.maxRange || 100, // Сброс рейнджа
-      visitedTiles: []
-    };
-  }
-
-  // 3. Проверка лимита хода (Range Check)
-  // Если рейндж кончился, инициируем возврат домой через A*
-  const currentRange = walker.currentRange ?? 0;
-  if (currentRange <= 0 && parentBuilding) {
-    // Инициируем поиск пути домой
-    try {
-      // Возвращаем флаг isCalculatingPath, чтобы заблокировать юнита до получения пути.
-      // Реальный путь будет установлен Store через promise, но здесь мы возвращаем намерение.
-      // В данной синхронной реализации мы вызываем async сервис и сразу возвращаем promise-based update?
-      // Архитектурно: Система возвращает объект для патча. Если A* асинхронный, мы ставим флаг.
-      
-      const update: Partial<GameEntity> = { isCalculatingPath: true };
-      
-      pathfinding.findPath(walker.position, parentBuilding.position, { failToClosest: true })
-        .then(result => {
-           // Внимание: этот колбек должен быть обработан уровнем выше (в Store), 
-           // либо мы предполагаем, что данная функция вызывается внутри async action.
-           // Но так как сигнатура функции возвращает Promise<Partial>, мы можем подождать.
-        });
-
-      // Ждем путь
-      const pathResult = await pathfinding.findPath(walker.position, parentBuilding.position, { failToClosest: true });
-      
+      // Reset range, clear history
       return {
-        state: 'RETURNING',
-        path: pathResult.path,
-        isCalculatingPath: false
+        state: 'IDLE',
+        currentRange: walker.maxRange || 50,
+        visitedTiles: [],
+        path: []
       };
-
-    } catch (e) {
-      console.error("Walker cannot find path home", e);
-      return { state: 'IDLE' }; // Застрял
-    }
   }
 
-  // 4. Логика Патрулирования (Patrol Path)
-  // Если у родительского здания есть заданный маршрут
+  // 2. Logic: Range Limit / Return Home
+  const currentRange = walker.currentRange ?? 50;
+  if (currentRange <= 0 && parentBuilding) {
+      return {
+          state: 'RETURNING',
+          isCalculatingPath: true // Will be resolved by caller calling Scheduler
+      };
+  }
+  
+  // 3. Logic: Patrol (Specific Route)
   if (parentBuilding?.patrolPath && parentBuilding.patrolPath.length > 0) {
     const currentIndex = walker.patrolIndex ?? 0;
     const targetPoint = parentBuilding.patrolPath[currentIndex];
     
-    // Если мы уже в целевой точке, переключаемся на следующую
-    if (Math.round(walker.position.x) === targetPoint.x && Math.round(walker.position.z) === targetPoint.z) {
-        const nextIndex = (currentIndex + 1) % parentBuilding.patrolPath.length;
-        return { patrolIndex: nextIndex }; // На следующем тике пойдем к новой точке
-    }
+    // Check if arrived at current waypoint
+    const dx = Math.abs(walker.position.x - targetPoint.x);
+    const dz = Math.abs(walker.position.z - targetPoint.z);
 
-    // Идем к текущей цели через A*
-    const pathResult = await pathfinding.findPath(walker.position, targetPoint, { failToClosest: true });
+    if (dx < 0.1 && dz < 0.1) {
+        const nextIndex = (currentIndex + 1) % parentBuilding.patrolPath.length;
+        return { patrolIndex: nextIndex }; // Just update index, move next tick
+    }
     
+    // Move to target
     return {
-      state: 'MOVING',
-      path: pathResult.path,
-      currentRange: currentRange - (pathResult.path.length * 1) // Примерное списание рейнджа
+        state: 'MOVING',
+        isCalculatingPath: true, // Needs A* to waypoint
     };
   }
 
-  // 5. Логика Случайного Блуждания (Random Walk)
-  // Работает только если нет патрульного пути.
-  
+  // 4. Logic: Random Walk (Road Following)
+  // This is synchronous logic, no A* needed for 1-step moves.
   const pos = walker.position;
   const candidates: Coordinates[] = [
-    { x: pos.x + 1, z: pos.z },
-    { x: pos.x - 1, z: pos.z },
-    { x: pos.x, z: pos.z + 1 },
-    { x: pos.x, z: pos.z - 1 }
+    { x: Math.round(pos.x + 1), z: Math.round(pos.z) },
+    { x: Math.round(pos.x - 1), z: Math.round(pos.z) },
+    { x: Math.round(pos.x), z: Math.round(pos.z + 1) },
+    { x: Math.round(pos.x), z: Math.round(pos.z - 1) }
   ];
 
-  // Фильтр 1: Только дороги
-  let validMoves = candidates.filter(c => isRoadTile(c.x, c.z, allEntities));
+  // Filter: Must be existing Road/Building
+  const validMoves = candidates.filter(c => isWalkableTarget(c.x, c.z, allEntities));
 
-  // Фильтр 2: Избегание недавно посещенных (Heuristic)
+  if (validMoves.length === 0) {
+      return { state: 'IDLE' };
+  }
+
+  // Filter: Avoid recently visited (History)
   const history = walker.visitedTiles || [];
   const unvisitedMoves = validMoves.filter(m => 
     !history.some(h => h.x === m.x && h.z === m.z)
   );
 
-  // Стратегия выбора
-  let nextTile: Coordinates | null = null;
+  let nextTile: Coordinates;
 
   if (unvisitedMoves.length > 0) {
-    // Приоритет: случайная непосещенная дорога
-    nextTile = unvisitedMoves[Math.floor(Math.random() * unvisitedMoves.length)];
-  } else if (validMoves.length > 0) {
-    // Тупик: возвращаемся назад (допускаем посещенную клетку)
-    nextTile = validMoves[Math.floor(Math.random() * validMoves.length)];
+      // Pick random unvisited
+      nextTile = unvisitedMoves[Math.floor(Math.random() * unvisitedMoves.length)];
   } else {
-    // Нет дорог рядом: стоим (или можно добавить логику блуждания по траве)
-    return { state: 'IDLE' }; 
+      // Dead end or backtracking needed: pick any valid move
+      nextTile = validMoves[Math.floor(Math.random() * validMoves.length)];
   }
 
-  // Формируем результат шага
-  // Для Random Walk путь состоит из 1 точки (соседняя клетка)
   const newHistory = [pos, ...history].slice(0, HISTORY_SIZE);
 
   return {
-    state: 'MOVING',
-    path: [nextTile], // Путь длиной в 1 шаг
-    currentRange: currentRange - 1,
-    visitedTiles: newHistory
+      state: 'MOVING',
+      path: [nextTile], // Immediate 1-tile path
+      currentRange: currentRange - 1,
+      visitedTiles: newHistory
   };
 };
