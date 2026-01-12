@@ -27,6 +27,7 @@ interface PathRequest {
 }
 
 const MAX_QUEUE_SIZE = 1000;
+const MAX_WAIT_TIME = 2000; // 2 seconds
 
 class PathfindingScheduler {
   private queues: Map<Priority, PathRequest[]>;
@@ -87,12 +88,25 @@ class PathfindingScheduler {
               reject(new Error("Queue full"));
               return;
           }
-          // Drop oldest LOW priority request to make space
+          // Drop BATCH of oldest LOW priority requests to make space
+          // Dropping multiple items reduces frequent queue thrashing
           const lowQueue = this.queues.get(Priority.LOW)!;
-          if (lowQueue.length > 0) {
-              const dropped = lowQueue.shift();
-              dropped?.reject(new Error("Dropped for higher priority"));
-              this.pendingRequests.delete(dropped!.key);
+          const dropCount = Math.min(10, lowQueue.length);
+          
+          if (dropCount > 0) {
+              for (let i = 0; i < dropCount; i++) {
+                const dropped = lowQueue.shift();
+                if (dropped) {
+                    dropped.reject(new Error("Dropped for higher priority"));
+                    // We must delete from pendingRequests here because the Promise wrapper
+                    // hasn't executed yet for these dropped items.
+                    this.pendingRequests.delete(dropped.key);
+                }
+              }
+          } else {
+             // If no LOW items to drop, reject current MEDIUM/HIGH (unlikely but safe)
+             reject(new Error("Queue full (Critical)"));
+             return; 
           }
       }
 
@@ -103,11 +117,11 @@ class PathfindingScheduler {
         options,
         priority,
         resolve: (res) => {
-            this.pendingRequests.delete(key);
+            // Cleanup happens in the finally block of processQueue logic
             resolve(res);
         },
         reject: (err) => {
-            this.pendingRequests.delete(key);
+             // Cleanup happens in the finally block of processQueue logic
             reject(err);
         },
         timestamp: performance.now()
@@ -139,10 +153,25 @@ class PathfindingScheduler {
       const queue = this.queues.get(priority)!;
 
       while (queue.length > 0) {
+        
+        // BUDGET GUARD: Check BEFORE doing work
+        if (performance.now() - startTime > budgetMs) {
+           return; 
+        }
+
         // Peek first, remove only if processed or aborted
         const request = queue[0];
+        
+        // --- Aging Check ---
+        if (performance.now() - request.timestamp > MAX_WAIT_TIME) {
+            queue.shift(); // Remove from queue
+            request.reject(new Error("Request Timed Out (Aging)"));
+            this.pendingRequests.delete(request.key);
+            this.droppedCount++;
+            continue;
+        }
 
-        // Check cancellation
+        // --- Cancellation Check ---
         if (request.options.signal?.aborted) {
             queue.shift(); // Remove
             request.reject(new Error("Aborted"));
@@ -166,11 +195,14 @@ class PathfindingScheduler {
         } catch (e) {
             queue.shift();
             request.reject(e);
-        }
-
-        // Check Budget
-        if (performance.now() - startTime > budgetMs) {
-           return; 
+        } finally {
+            // ROBUST CLEANUP: Always ensure map is cleared
+            if (this.pendingRequests.has(request.key)) {
+                // If it was resolved/rejected above, the map entry might still exist 
+                // if we didn't delete it inside resolve/reject wrappers.
+                // To be safe, we delete it here, as this is the single point of completion.
+                this.pendingRequests.delete(request.key);
+            }
         }
       }
     }

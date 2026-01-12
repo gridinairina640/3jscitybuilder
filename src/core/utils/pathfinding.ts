@@ -17,13 +17,12 @@
 import { TileData, TileType } from '../../entities/Map';
 import { Coordinates } from '../../shared/types';
 
-// REFERENCE: High-performance A* Pathfinding (v3.14.0)
-// Improvements (v3.14.0):
-// - API: Public getPathKey for consistent deduplication in Scheduler.
-// - Cache: True LRU behavior (promote on hit).
-// - Heap: Pre-allocated to full map size to avoid resizing.
-// - Heuristic: Lowered cross-product penalty for better admissibility.
-// - Perf: Inlined coordinate conversions in reconstructPath.
+// REFERENCE: High-performance A* Pathfinding (v3.16.0)
+// Improvements (v3.16.0):
+// - Cache: Added maxIterations to cache key for stricter correctness.
+// - Perf: Removed Heap.resize() (Pre-allocated to worst-case).
+// - Logic: Dynamic minStepCost calculation for heuristic admissibility.
+// - Safety: reconstructPath now checks SearchID ownership to prevent stale data.
 
 const COSTS = {
   ROAD: 0.5,
@@ -96,15 +95,22 @@ class FlatMinHeap {
   private f: Float32Array;
   private g: Float32Array;
   public length: number = 0;
+  private capacity: number;
 
-  constructor(initialCapacity: number) {
-    this.indices = new Int32Array(initialCapacity);
-    this.f = new Float32Array(initialCapacity);
-    this.g = new Float32Array(initialCapacity);
+  constructor(capacity: number) {
+    this.capacity = capacity;
+    this.indices = new Int32Array(capacity);
+    this.f = new Float32Array(capacity);
+    this.g = new Float32Array(capacity);
   }
 
   push(index: number, fVal: number, gVal: number) {
-    if (this.length >= this.indices.length) this.resize();
+    // Heap is pre-allocated to Grid Size, so overflow should logically never happen
+    // unless logic is broken (inserting duplicates excessively).
+    if (this.length >= this.capacity) {
+        return; 
+    }
+    
     const i = this.length;
     this.indices[i] = index;
     this.f[i] = fVal;
@@ -130,18 +136,7 @@ class FlatMinHeap {
   clear() { this.length = 0; }
   isEmpty() { return this.length === 0; }
 
-  private resize() {
-    const newCap = Math.max(this.indices.length * 2, 16);
-    const newInd = new Int32Array(newCap);
-    const newF = new Float32Array(newCap);
-    const newG = new Float32Array(newCap);
-    newInd.set(this.indices);
-    newF.set(this.f);
-    newG.set(this.g);
-    this.indices = newInd;
-    this.f = newF;
-    this.g = newG;
-  }
+  // Resizing removed: We allocate for Worst Case (Total Tiles)
 
   private bubbleUp(idx: number) {
     while (idx > 0) {
@@ -210,7 +205,7 @@ export class PathfindingService {
   private totalTiles: number = 0;
   private halfSize: number = 0;
   private gridVersion: number = 0;
-  private readonly minStepCost: number = COSTS.MIN_STEP;
+  private minStepCost: number = COSTS.MIN_STEP;
   private globalSearchId: number = 0;
   
   // Tie-breaker state
@@ -256,6 +251,10 @@ export class PathfindingService {
       }
     });
 
+    // Dynamic minStepCost calculation for Admissibility
+    const costs = Object.values(WEIGHT_MAP).filter(c => Number.isFinite(c));
+    this.minStepCost = costs.length > 0 ? Math.min(...costs) : COSTS.MIN_STEP;
+
     this.bufferPool = [];
     this.gridVersion++;
     this.pathCache.clear();
@@ -299,8 +298,9 @@ export class PathfindingService {
       const safeHWeight = Math.round(hWeight * 1000) / 1000;
       const includeStart = options.includeStartNode ?? false;
       const failToClosest = options.failToClosest ?? false;
+      const maxIter = options.maxIterations ?? this.defaultMaxIterations;
 
-      return `${sIdx}-${eIdx}-${safeHWeight}-${includeStart}-${failToClosest}`;
+      return `${sIdx}-${eIdx}-${safeHWeight}-${includeStart}-${failToClosest}-${maxIter}`;
   }
 
   public getStaticPath(fromId: string, toId: string): Coordinates[] | null {
@@ -524,7 +524,11 @@ export class PathfindingService {
       nodeTags[currentIdx] = (currentId << 2) | STATE_CLOSED;
 
       if (currentIdx === endIdx) {
-        return { path: this.reconstructPath(endIdx, parentIndex, includeStart), status: 'success', iterations };
+        return { 
+          path: this.reconstructPath(endIdx, parentIndex, includeStart, nodeTags, currentId), 
+          status: 'success', 
+          iterations 
+        };
       }
 
       const count = this.fillNeighborsBuffer(currentIdx, neighbors);
@@ -583,7 +587,11 @@ export class PathfindingService {
          if (parentIndex[closestNodeIdx] === -1 && closestNodeIdx !== startIdx) {
              return { path: [], status: 'no_path', iterations };
          }
-         return { path: this.reconstructPath(closestNodeIdx, parentIndex, includeStart), status: 'partial_path', iterations };
+         return { 
+             path: this.reconstructPath(closestNodeIdx, parentIndex, includeStart, nodeTags, currentId), 
+             status: 'partial_path', 
+             iterations 
+         };
     }
 
     return { path: [], status: iterations > maxIterations ? 'timeout' : 'no_path', iterations };
@@ -614,7 +622,13 @@ export class PathfindingService {
       if (this.bufferPool.length < this.maxPoolSize) this.bufferPool.push(buffers);
   }
 
-  private reconstructPath(endIdx: number, parentIndex: Int32Array, includeStart: boolean): Coordinates[] {
+  private reconstructPath(
+    endIdx: number, 
+    parentIndex: Int32Array, 
+    includeStart: boolean,
+    nodeTags: Uint32Array,
+    searchId: number
+  ): Coordinates[] {
     const path: Coordinates[] = [];
     let curr = endIdx;
     let safety = 0;
@@ -625,6 +639,15 @@ export class PathfindingService {
     const size = this.size;
 
     while (curr !== -1 && safety < maxLen) {
+      // Validate node ownership for current search
+      const tagVal = nodeTags[curr];
+      const tagId = tagVal >>> 2;
+      
+      // Ensure we don't traverse into stale data from previous searches
+      if (tagId !== searchId) {
+          break;
+      }
+
       const gx = curr % size;
       const gz = (curr / size) | 0;
       // Inline toWorld conversion
