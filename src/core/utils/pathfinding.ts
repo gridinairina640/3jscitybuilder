@@ -17,12 +17,13 @@
 import { TileData, TileType } from '../../entities/Map';
 import { Coordinates } from '../../shared/types';
 
-// REFERENCE: High-performance A* Pathfinding (v3.12.0)
-// Improvements (v3.12.0):
-// - Memory: Merged nodeState & closedSet into single Uint32Array (bitmasking).
-// - Perf: Inlined heuristic calculation inside hot loop.
-// - Precision: Improved cache key generation and coordinate rounding.
-// - Logic: Fixed Admissibility concerns with Cross Product.
+// REFERENCE: High-performance A* Pathfinding (v3.14.0)
+// Improvements (v3.14.0):
+// - API: Public getPathKey for consistent deduplication in Scheduler.
+// - Cache: True LRU behavior (promote on hit).
+// - Heap: Pre-allocated to full map size to avoid resizing.
+// - Heuristic: Lowered cross-product penalty for better admissibility.
+// - Perf: Inlined coordinate conversions in reconstructPath.
 
 const COSTS = {
   ROAD: 0.5,
@@ -281,6 +282,27 @@ export class PathfindingService {
     return Number.isFinite(this.grid[idx]);
   }
 
+  /**
+   * Generates a deterministic key for a path request based on Grid Indices.
+   * This ensures that slight floating point variations in World Coordinates
+   * do not cause cache misses or failed deduplication.
+   */
+  public getPathKey(start: Coordinates, end: Coordinates, options: PathOptions): string {
+      const sIdx = this.toIndex(start.x, start.z);
+      const eIdx = this.toIndex(end.x, end.z);
+      
+      if (sIdx === -1 || eIdx === -1) {
+          return `INV:${start.x},${start.z}->${end.x},${end.z}`;
+      }
+
+      const hWeight = options.heuristicWeight ?? 1.0;
+      const safeHWeight = Math.round(hWeight * 1000) / 1000;
+      const includeStart = options.includeStartNode ?? false;
+      const failToClosest = options.failToClosest ?? false;
+
+      return `${sIdx}-${eIdx}-${safeHWeight}-${includeStart}-${failToClosest}`;
+  }
+
   public getStaticPath(fromId: string, toId: string): Coordinates[] | null {
       const key = `static:${fromId}:${toId}`;
       const cached = this.pathCache.get(key);
@@ -298,22 +320,17 @@ export class PathfindingService {
   }
 
   public checkCache(start: Coordinates, end: Coordinates, options: PathOptions = {}): PathResult | null {
-      const sIdx = this.toIndex(start.x, start.z);
-      const eIdx = this.toIndex(end.x, end.z);
-      
-      if (sIdx === -1 || eIdx === -1) return null;
-
-      const hWeight = options.heuristicWeight ?? 1.0;
-      const includeStart = options.includeStartNode ?? false;
-      const failToClosest = options.failToClosest ?? false;
-      
-      // Increased precision for cache key to prevent collisions (1.001 vs 1.000)
-      const safeHWeight = Math.round(hWeight * 1000) / 1000;
-      const cacheKey = `${sIdx}-${eIdx}-${safeHWeight}-${includeStart}-${failToClosest}`;
+      const cacheKey = this.getPathKey(start, end, options);
+      if (cacheKey.startsWith('INV:')) return null;
 
       const cached = this.pathCache.get(cacheKey);
       if (cached && cached.version === this.gridVersion) {
           this.cacheHits++;
+          
+          // TRUE LRU: Promote to newest by deleting and re-setting
+          this.pathCache.delete(cacheKey);
+          this.pathCache.set(cacheKey, cached);
+
           return { 
             path: [...cached.path], 
             status: 'success',
@@ -344,8 +361,19 @@ export class PathfindingService {
   ): PathResult {
     const startTime = performance.now();
     
-    const cachedResult = this.checkCache(start, end, options);
-    if (cachedResult) return cachedResult;
+    // Use consistent key generation
+    const cacheKey = this.getPathKey(start, end, options);
+    
+    // Internal cache check (manual, to avoid double key gen if calling checkCache)
+    if (!cacheKey.startsWith('INV:')) {
+        const cached = this.pathCache.get(cacheKey);
+        if (cached && cached.version === this.gridVersion) {
+            this.cacheHits++;
+            this.pathCache.delete(cacheKey);
+            this.pathCache.set(cacheKey, cached);
+            return { path: [...cached.path], status: 'success', metrics: { iterations: 0, duration: 0, cached: true } };
+        }
+    }
 
     if (options.signal?.aborted) return { path: [], status: 'aborted' };
 
@@ -372,9 +400,6 @@ export class PathfindingService {
     const safetyLimit = Math.max(this.totalTiles * 2, 50000);
     const maxIter = Math.min(options.maxIterations ?? this.defaultMaxIterations, safetyLimit);
     const hWeight = options.heuristicWeight ?? 1.0;
-    
-    const safeHWeight = Math.round(hWeight * 1000) / 1000;
-    const cacheKey = `${sIdx}-${eIdx}-${safeHWeight}-${includeStart}-${failToClosest}`;
 
     try {
         const result = this.calculateAStar(
@@ -383,7 +408,7 @@ export class PathfindingService {
         );
         const duration = performance.now() - startTime;
         
-        if (result.status === 'success') {
+        if (result.status === 'success' && !cacheKey.startsWith('INV:')) {
           if (this.pathCache.size >= this.maxCacheSize) {
               const oldestKey = this.pathCache.keys().next().value;
               if (oldestKey) this.pathCache.delete(oldestKey);
@@ -537,11 +562,11 @@ export class PathfindingService {
           let h = (Math.abs(nx - ex) + Math.abs(nz - ez)) * minStep;
           
           // 2. Tie-Breaking: Cross-Product (Inline)
-          // Only add small penalty to straighten paths
+          // Reduced penalty to preserve admissibility
           const dx2 = nx - startGX;
           const dz2 = nz - startGZ;
           const cross = Math.abs(dx1 * dz2 - dx2 * dz1);
-          h += cross * 0.0001;
+          h += cross * 0.00001;
 
           const f = tentativeG + (h * heuristicWeight);
           
@@ -569,7 +594,8 @@ export class PathfindingService {
           gScore: new Float32Array(size),
           parentIndex: new Int32Array(size),
           nodeTags: new Uint32Array(size), // Combined
-          heap: new FlatMinHeap(Math.max(16, (size / 4) | 0)),
+          // Use full map size for heap to prevent resizing during worst-case paths
+          heap: new FlatMinHeap(size),
           neighbors: new Int32Array(MAX_NEIGHBORS)
       };
   }
@@ -594,10 +620,15 @@ export class PathfindingService {
     let safety = 0;
     const maxLen = this.totalTiles;
 
+    // Pre-calc halfSize to avoid property access in loop
+    const halfSize = this.halfSize;
+    const size = this.size;
+
     while (curr !== -1 && safety < maxLen) {
-      const gx = curr % this.size;
-      const gz = (curr / this.size) | 0;
-      path.push({ x: this.toWorldX(gx), z: this.toWorldZ(gz) });
+      const gx = curr % size;
+      const gz = (curr / size) | 0;
+      // Inline toWorld conversion
+      path.push({ x: gx - halfSize, z: gz - halfSize });
       curr = parentIndex[curr];
       safety++;
     }

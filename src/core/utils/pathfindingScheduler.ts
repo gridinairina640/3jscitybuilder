@@ -38,6 +38,8 @@ class PathfindingScheduler {
   // Debug metrics
   private processedCount = 0;
   private droppedCount = 0;
+  private totalWaitTime = 0;
+  private processedWaitCount = 0;
 
   constructor(service: PathfindingService) {
     this.service = service;
@@ -66,9 +68,9 @@ class PathfindingScheduler {
       return Promise.resolve(cached);
     }
     
-    // 2. Generate Deduplication Key
-    // Key format: sx,sz-ex,ez-hWeight-failToClosest
-    const key = `${start.x},${start.z}-${end.x},${end.z}-${options.heuristicWeight ?? 1}-${options.failToClosest ?? false}`;
+    // 2. Generate Deduplication Key using Service logic (Grid Indices)
+    // This ensures that two units close to each other mapped to the same tile share the request.
+    const key = this.service.getPathKey(start, end, options);
     
     // 3. Check Pending Requests
     if (this.pendingRequests.has(key)) {
@@ -137,7 +139,8 @@ class PathfindingScheduler {
       const queue = this.queues.get(priority)!;
 
       while (queue.length > 0) {
-        const request = queue[0]; // Peek
+        // Peek first, remove only if processed or aborted
+        const request = queue[0];
 
         // Check cancellation
         if (request.options.signal?.aborted) {
@@ -151,14 +154,21 @@ class PathfindingScheduler {
             // Execute synchronous pathfinding
             const result = this.service.findPathSync(request.start, request.end, request.options);
             
-            queue.shift(); // Remove after success
+            queue.shift(); // Remove after processing
             request.resolve(result);
+            
+            // Metrics
+            const waitTime = performance.now() - request.timestamp;
+            this.totalWaitTime += waitTime;
+            this.processedWaitCount++;
+            
             processed++;
         } catch (e) {
             queue.shift();
             request.reject(e);
         }
 
+        // Check Budget
         if (performance.now() - startTime > budgetMs) {
            return; 
         }
